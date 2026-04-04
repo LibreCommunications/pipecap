@@ -1,0 +1,14 @@
+{
+  "name": "@librecord/pipecap-linux-x64-gnu",
+  "version": "0.1.0",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "main": "pipecap.linux-x64-gnu.node",
+  "files": ["pipecap.linux-x64-gnu.node"],
+  "description": "pipecap native binding for linux-x64-gnu",
+  "license": "AGPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LibreCommunications/pipecap"
+  }
+}

@@ -1,10 +1,14 @@
 {
-  "name": "pipecap",
+  "name": "@librecord/pipecap",
   "version": "0.1.0",
-  "description": "Native PipeWire screen capture for Electron — portal picker + video frames",
+  "description": "Native PipeWire screen capture for Electron — xdg-desktop-portal picker + video frames",
   "main": "index.js",
   "types": "index.d.ts",
   "license": "AGPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LibreCommunications/pipecap"
+  },
   "os": ["linux"],
   "napi": {
     "name": "pipecap",
@@ -18,9 +22,16 @@
   },
   "scripts": {
     "build": "napi build --platform --release",
-    "build:debug": "napi build --platform"
+    "build:debug": "napi build --platform",
+    "prepublishOnly": "napi prepublish -t npm",
+    "artifacts": "napi artifacts",
+    "version": "napi version"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2"
-  }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ]
 }
