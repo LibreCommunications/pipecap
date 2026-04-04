@@ -37,28 +37,56 @@ function createScreenShareStream(options = {}) {
   const fps = options.fps || 30;
   const includeAudio = options.audio || false;
 
-  // Video: canvas → captureStream
+  // Video: WebGL canvas → captureStream (GPU B↔R swap)
   const canvas = document.createElement('canvas');
   canvas.width = 1920;
   canvas.height = 1080;
-  const ctx = canvas.getContext('2d');
+  const gl = canvas.getContext('webgl2');
+
+  // Shader swaps B↔R on the GPU — zero CPU cost
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, `#version 300 es
+    in vec2 pos; out vec2 uv;
+    void main() { uv = pos * 0.5 + 0.5; uv.y = 1.0 - uv.y; gl_Position = vec4(pos, 0, 1); }
+  `);
+  gl.compileShader(vs);
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fs, `#version 300 es
+    precision mediump float; in vec2 uv; uniform sampler2D tex; out vec4 color;
+    void main() { vec4 c = texture(tex, uv); color = vec4(c.b, c.g, c.r, 1.0); }
+  `);
+  gl.compileShader(fs);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+  gl.linkProgram(prog); gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+  const posLoc = gl.getAttribLocation(prog, 'pos');
+  gl.enableVertexAttribArray(posLoc);
+  gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+  let curW = 0, curH = 0;
+
   const videoStream = canvas.captureStream(fps);
 
   const cleanups = [];
 
-  // Listen for video frames
   const unsubFrame = window.pipecap.onFrame((frame) => {
-    if (canvas.width !== frame.width || canvas.height !== frame.height) {
-      canvas.width = frame.width;
-      canvas.height = frame.height;
+    if (frame.width !== curW || frame.height !== curH) {
+      canvas.width = frame.width; canvas.height = frame.height;
+      gl.viewport(0, 0, frame.width, frame.height);
+      curW = frame.width; curH = frame.height;
     }
-    // frame.data is RGBA pixels
-    const imageData = new ImageData(
-      new Uint8ClampedArray(frame.data),
-      frame.width,
-      frame.height,
-    );
-    ctx.putImageData(imageData, 0, 0);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, frame.width, frame.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(frame.data));
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   });
   cleanups.push(unsubFrame);
 
