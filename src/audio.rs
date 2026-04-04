@@ -1,7 +1,6 @@
 //! PipeWire audio stream consumer.
-//! Captures system audio from a PipeWire node as interleaved f32 PCM.
-//! Uses the same approach as venmic but without creating a virtual mic —
-//! we capture directly from PipeWire and return raw audio buffers.
+//! Captures system audio output as interleaved f32 PCM via PipeWire's
+//! sink monitor. Filters out the calling process to prevent feedback.
 
 use pipewire as pw;
 use std::sync::{
@@ -9,15 +8,12 @@ use std::sync::{
     Arc, Mutex,
 };
 
-/// Raw audio buffer.
 pub struct AudioBuffer {
     pub channels: u32,
     pub sample_rate: u32,
     pub data: Vec<f32>,
 }
 
-/// PipeWire audio capturer. Runs on a background thread and accumulates
-/// audio samples for the caller to read.
 pub struct AudioCapturer {
     buffer: Arc<Mutex<Vec<f32>>>,
     channels: Arc<Mutex<u32>>,
@@ -27,8 +23,6 @@ pub struct AudioCapturer {
 }
 
 impl AudioCapturer {
-    /// Create a new audio capturer linked to the system audio output.
-    /// Excludes the given PID (our own process) to prevent feedback.
     pub fn new(exclude_pid: u32) -> anyhow::Result<Self> {
         let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
         let channels: Arc<Mutex<u32>> = Arc::new(Mutex::new(2));
@@ -55,7 +49,6 @@ impl AudioCapturer {
         })
     }
 
-    /// Drain accumulated audio samples. Returns None if no samples yet.
     pub fn read_audio(&self) -> Option<AudioBuffer> {
         let mut lock = self.buffer.lock().ok()?;
         if lock.is_empty() {
@@ -70,6 +63,10 @@ impl AudioCapturer {
             data,
         })
     }
+
+    pub fn is_active(&self) -> bool {
+        !self.stop_flag.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for AudioCapturer {
@@ -82,10 +79,10 @@ impl Drop for AudioCapturer {
 }
 
 fn run_audio_loop(
-    _exclude_pid: u32,
+    exclude_pid: u32,
     buffer: Arc<Mutex<Vec<f32>>>,
-    channels: Arc<Mutex<u32>>,
-    sample_rate: Arc<Mutex<u32>>,
+    _channels: Arc<Mutex<u32>>,
+    _sample_rate: Arc<Mutex<u32>>,
     stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     pw::init();
@@ -94,34 +91,25 @@ fn run_audio_loop(
     let context = pw::context::ContextBox::new(mainloop.loop_(), None)?;
     let core = context.connect(None)?;
 
-    // Capture system audio output
     let mut props = pw::properties::PropertiesBox::new();
     props.insert(*pw::keys::MEDIA_TYPE, "Audio");
     props.insert(*pw::keys::MEDIA_CATEGORY, "Capture");
     props.insert(*pw::keys::MEDIA_ROLE, "Screen");
-    // Capture from the default audio sink monitor
     props.insert("stream.capture.sink", "true");
+    // Exclude our own process audio to prevent feedback loop
+    if exclude_pid > 0 {
+        props.insert("stream.dont-remix", "true");
+        props.insert(
+            "node.exclude-from-capture.pids",
+            &*exclude_pid.to_string(),
+        );
+    }
     let stream = pw::stream::StreamBox::new(&core, "pipecap-audio", props)?;
 
     let buf_ref = buffer;
-    let ch_ref = channels;
-    let sr_ref = sample_rate;
 
     let _listener = stream
         .add_local_listener_with_user_data(())
-        .param_changed(move |_stream, _user_data, id, _pod| {
-            // When format is negotiated, extract channels and sample rate
-            // id == SPA_PARAM_Format
-            if id == libspa::param::ParamType::Format.as_raw() {
-                // Default to stereo 48kHz — PipeWire usually negotiates this
-                if let Ok(mut ch) = ch_ref.lock() {
-                    *ch = 2;
-                }
-                if let Ok(mut sr) = sr_ref.lock() {
-                    *sr = 48000;
-                }
-            }
-        })
         .process(move |stream_ref, _user_data| {
             if let Some(mut buffer) = stream_ref.dequeue_buffer() {
                 let datas = buffer.datas_mut();
@@ -133,7 +121,6 @@ fn run_audio_loop(
                     if let Some(slice) = data.data() {
                         if size > 0 && offset + size <= slice.len() {
                             let audio_bytes = &slice[offset..offset + size];
-                            // PipeWire delivers f32 samples by default
                             let samples: &[f32] = unsafe {
                                 std::slice::from_raw_parts(
                                     audio_bytes.as_ptr() as *const f32,
@@ -142,9 +129,9 @@ fn run_audio_loop(
                             };
                             if let Ok(mut lock) = buf_ref.lock() {
                                 lock.extend_from_slice(samples);
-                                // Cap buffer at ~1 second of stereo 48kHz to prevent unbounded growth
-                                const MAX_SAMPLES: usize = 48000 * 2;
-                                if lock.len() > MAX_SAMPLES * 2 {
+                                // Cap at ~2 seconds of stereo 48kHz
+                                const MAX_SAMPLES: usize = 48000 * 2 * 2;
+                                if lock.len() > MAX_SAMPLES {
                                     let drain = lock.len() - MAX_SAMPLES;
                                     lock.drain(..drain);
                                 }
@@ -156,10 +143,9 @@ fn run_audio_loop(
         })
         .register()?;
 
-    // Connect as a capture stream — PipeWire routes system audio to us
     stream.connect(
         libspa::utils::Direction::Input,
-        None, // No specific node — capture default sink monitor
+        None,
         pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
         &mut [],
     )?;

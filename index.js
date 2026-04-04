@@ -42,18 +42,6 @@ switch (platform) {
           loadError = e
         }
         break
-      case 'arm64':
-        localFileExisted = existsSync(join(__dirname, 'pipecap.linux-arm64-gnu.node'))
-        try {
-          if (localFileExisted) {
-            nativeBinding = require('./pipecap.linux-arm64-gnu.node')
-          } else {
-            nativeBinding = require('@librecord/pipecap-linux-arm64-gnu')
-          }
-        } catch (e) {
-          loadError = e
-        }
-        break
       default:
         throw new Error(`Unsupported architecture on Linux: ${arch}`)
     }
@@ -69,10 +57,11 @@ if (!nativeBinding) {
   throw new Error('Failed to load native binding')
 }
 
-const { showPicker, startCapture, readFrame, readAudio, stopCapture } = nativeBinding
+const { showPicker, startCapture, readFrame, readAudio, stopCapture, isCapturing } = nativeBinding
 
 module.exports.showPicker = showPicker
 module.exports.startCapture = startCapture
 module.exports.readFrame = readFrame
 module.exports.readAudio = readAudio
 module.exports.stopCapture = stopCapture
+module.exports.isCapturing = isCapturing

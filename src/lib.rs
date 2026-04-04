@@ -80,8 +80,6 @@ pub async fn show_picker(source_types: u32) -> Result<Option<Vec<PortalStream>>>
 #[napi(object)]
 pub struct CaptureOptions {
     pub node_id: u32,
-    pub width: u32,
-    pub height: u32,
     pub fps: u32,
     pub audio: bool,
     /// PID of the current process — used to exclude own audio output from capture.
@@ -98,7 +96,7 @@ pub fn start_capture(options: CaptureOptions) -> Result<()> {
             .lock()
             .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
         lock.take();
-        let capturer = capture::Capturer::new(options.node_id, options.width, options.height, options.fps)
+        let capturer = capture::Capturer::new(options.node_id, options.fps)
             .map_err(|e| Error::new(Status::GenericFailure, format!("capture error: {e}")))?;
         *lock = Some(capturer);
     }
@@ -161,6 +159,14 @@ pub fn read_audio() -> Result<Option<AudioChunk>> {
             }
         },
     }
+}
+
+/// Check if capture is currently active.
+#[napi]
+pub fn is_capturing() -> bool {
+    let video = CAPTURER.lock().map(|l| l.is_some()).unwrap_or(false);
+    let audio = AUDIO_CAPTURER.lock().map(|l| l.is_some()).unwrap_or(false);
+    video || audio
 }
 
 /// Stop all capture (video + audio) and release PipeWire resources.

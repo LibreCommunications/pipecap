@@ -9,8 +9,6 @@ export interface PortalStream {
 
 export interface CaptureOptions {
   nodeId: number
-  width: number
-  height: number
   fps: number
   audio: boolean
   /** PID of the current process — used to exclude own audio output from capture. */
@@ -54,6 +52,11 @@ export function readFrame(): Frame | null
  * Audio is interleaved f32 PCM (typically stereo 48kHz). Buffer is drained on each call.
  */
 export function readAudio(): AudioChunk | null
+
+/**
+ * Check if capture is currently active.
+ */
+export function isCapturing(): boolean
 
 /**
  * Stop all capture (video + audio) and release PipeWire resources.
