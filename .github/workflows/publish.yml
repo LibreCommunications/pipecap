@@ -50,14 +50,15 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
+      - run: npm install
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Move artifacts to platform packages
-        run: |
-          npx napi artifacts --dir artifacts --npm-dir npm
+        run: npx napi artifacts --dir artifacts --npm-dir npm
 
       - name: Publish platform packages
         env:
