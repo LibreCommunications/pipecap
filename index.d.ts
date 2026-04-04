@@ -13,6 +13,13 @@ export interface Frame {
   data: Buffer
 }
 
+export interface AudioChunk {
+  channels: number
+  sampleRate: number
+  /** Interleaved f32 PCM samples as little-endian bytes */
+  data: Buffer
+}
+
 /**
  * Show the native xdg-desktop-portal screen/window picker.
  * `sourceTypes`: 1=monitors, 2=windows, 3=both.
@@ -32,6 +39,25 @@ export function startCapture(nodeId: number, width: number, height: number): voi
 export function readFrame(): Frame | null
 
 /**
- * Stop capturing and release PipeWire resources.
+ * Stop video capture and release PipeWire resources.
  */
 export function stopCapture(): void
+
+/**
+ * Start capturing system audio via PipeWire.
+ * Captures from the default audio output (monitor).
+ * `excludePid`: PID of the current process to prevent feedback.
+ */
+export function startAudioCapture(excludePid: number): void
+
+/**
+ * Read accumulated audio samples. Returns null if no audio available.
+ * Audio is interleaved f32 PCM (typically stereo 48kHz).
+ * The buffer is drained on each call.
+ */
+export function readAudio(): AudioChunk | null
+
+/**
+ * Stop audio capture.
+ */
+export function stopAudioCapture(): void
