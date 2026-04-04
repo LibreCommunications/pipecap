@@ -15,9 +15,20 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
 
       - name: Install PipeWire dev headers
         run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev
@@ -34,7 +45,6 @@ jobs:
           path: "*.node"
           if-no-files-found: error
 
-  # Simple smoke test on native x64
   test:
     needs: build
     runs-on: ubuntu-latest
