@@ -58,7 +58,7 @@ jobs:
           merge-multiple: true
 
       - name: Move artifacts to platform packages
-        run: npx napi artifacts --dir artifacts --npm-dir npm
+        run: cp artifacts/*.node npm/linux-x64-gnu/
 
       - name: Publish platform packages
         env:
