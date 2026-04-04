@@ -10,54 +10,57 @@ export interface PortalStream {
   width: number
   height: number
 }
-/** A single video frame (RGBA pixels). */
-export interface Frame {
-  width: number
-  height: number
-  data: Buffer
+/** Result from the portal picker — streams + PipeWire remote fd. */
+export interface PickerResult {
+  streams: Array<PortalStream>
+  pipewireFd: number
 }
 /** Audio samples (interleaved f32 PCM). */
 export interface AudioChunk {
   channels: number
   sampleRate: number
-  /** Interleaved f32 PCM samples as little-endian bytes. */
   data: Buffer
 }
-/**
- * Show the native xdg-desktop-portal screen/window picker.
- * `source_types`: 1=monitors, 2=windows, 3=both.
- * Returns the selected stream(s), or null if the user cancelled.
- * Result from the portal picker — streams + PipeWire remote fd.
- */
-export interface PickerResult {
-  streams: Array<PortalStream>
-  /** Raw fd to the PipeWire remote. Pass this to startCapture. */
-  pipewireFd: number
+/** Shared memory info returned by startCapture. */
+export interface ShmInfo {
+  shmPath: string
+  shmSize: number
+  headerSize: number
 }
-export declare function showPicker(sourceTypes: number): Promise<PickerResult | null>
 /** Capture options. */
 export interface CaptureOptions {
   nodeId: number
-  /** PipeWire remote fd from showPicker(). */
   pipewireFd: number
   fps: number
   audio: boolean
-  /** PID of the current process — used to exclude own audio output from capture. */
   excludePid?: number
 }
+export declare function showPicker(sourceTypes: number): Promise<PickerResult | null>
 /**
- * Start capturing from a PipeWire node.
- * `node_id` must come from show_picker() (portal-consented).
+ * Start capturing. Returns a Buffer backed by the shared memory region.
+ * The renderer can read frames directly from this buffer — zero copy.
+ *
+ * Layout: ShmHeader (32 bytes) + slot0 + slot1
+ * ShmHeader: { seq: u64, width: u32, height: u32, stride: u32, data_offset: u32, data_size: u32 }
+ * Poll seq to detect new frames, read pixels from data_offset..data_offset+data_size.
+ * Start capturing. Returns a handle object with shm info.
+ * Call `getShmBuffer()` to get a zero-copy view into the shared memory.
  */
-export declare function startCapture(options: CaptureOptions): void
-/** Read the latest video frame. Returns null if no frame is available yet. */
-export declare function readFrame(): Frame | null
-/**
- * Read accumulated audio samples. Returns null if no audio available or audio not enabled.
- * Audio is interleaved f32 PCM (typically stereo 48kHz). Buffer is drained on each call.
- */
+export declare function startCapture(options: CaptureOptions): ShmInfo
+/** Read accumulated audio samples. Returns null if not available. */
 export declare function readAudio(): AudioChunk | null
+/**
+ * Read the current frame header from shared memory. Returns [seq, width, height, dataOffset, dataSize].
+ * The renderer uses this to know where to read pixels from the mmap'd buffer.
+ * Returns null if not capturing or no frame available.
+ */
+export declare function readFrameInfo(): Array<number> | null
+/**
+ * Read frame pixels from shared memory. Zero-copy — returns a Buffer view into mmap'd memory.
+ * `offset` and `size` come from readFrameInfo().
+ */
+export declare function readFramePixels(offset: number, size: number): Buffer
 /** Check if capture is currently active. */
 export declare function isCapturing(): boolean
-/** Stop all capture (video + audio) and release PipeWire resources. */
+/** Stop all capture (video + audio) and release resources. */
 export declare function stopCapture(): void

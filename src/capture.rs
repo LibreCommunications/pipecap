@@ -1,5 +1,6 @@
 //! PipeWire video stream consumer.
-//! Connects to a portal's PipeWire remote and captures video frames.
+//! Connects to a portal's PipeWire remote and captures video frames
+//! into shared memory for zero-copy access from the renderer.
 
 use pipewire as pw;
 use pw::spa;
@@ -7,49 +8,42 @@ use spa::pod::Pod;
 use std::os::fd::{OwnedFd, FromRawFd};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 
-pub struct RawFrame {
-    pub width: u32,
-    pub height: u32,
-    pub data: Vec<u8>,
-}
+use crate::shm::ShmBuffer;
 
 pub struct Capturer {
-    latest_frame: Arc<Mutex<Option<RawFrame>>>,
+    shm: Arc<ShmBuffer>,
     stop_flag: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Capturer {
-    pub fn new(node_id: u32, pipewire_fd: i32, _fps: u32) -> anyhow::Result<Self> {
-        let latest_frame: Arc<Mutex<Option<RawFrame>>> = Arc::new(Mutex::new(None));
+    pub fn new(node_id: u32, pipewire_fd: i32, fps: u32) -> anyhow::Result<Self> {
+        // Max frame size: 8K @ 4bpp = 7680*4320*4 = ~133MB. Be generous.
+        let max_frame = 7680 * 4320 * 4;
+        let shm = Arc::new(ShmBuffer::new(max_frame)?);
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        let frame_ref = latest_frame.clone();
+        let shm_ref = shm.clone();
         let stop_ref = stop_flag.clone();
 
         let thread = std::thread::spawn(move || {
-            if let Err(e) = run_capture_loop(node_id, pipewire_fd, frame_ref, stop_ref) {
+            if let Err(e) = run_capture_loop(node_id, pipewire_fd, fps, shm_ref, stop_ref) {
                 eprintln!("pipecap: capture loop error: {e}");
             }
         });
 
-        Ok(Capturer {
-            latest_frame,
-            stop_flag,
-            thread: Some(thread),
-        })
+        Ok(Capturer { shm, stop_flag, thread: Some(thread) })
     }
 
-    pub fn read_frame(&self) -> Option<RawFrame> {
-        let lock = self.latest_frame.lock().ok()?;
-        lock.as_ref().map(|f| RawFrame {
-            width: f.width,
-            height: f.height,
-            data: f.data.clone(),
-        })
+    pub fn shm_ptr(&self) -> *mut u8 {
+        self.shm.ptr()
+    }
+
+    pub fn shm_size(&self) -> usize {
+        self.shm.size()
     }
 
     pub fn is_active(&self) -> bool {
@@ -69,7 +63,8 @@ impl Drop for Capturer {
 fn run_capture_loop(
     node_id: u32,
     pipewire_fd: i32,
-    latest_frame: Arc<Mutex<Option<RawFrame>>>,
+    fps: u32,
+    shm: Arc<ShmBuffer>,
     stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     pw::init();
@@ -87,9 +82,6 @@ fn run_capture_loop(
     props.insert(*pw::keys::MEDIA_ROLE, "Screen");
     let stream = pw::stream::StreamBox::new(&core, "pipecap-video", props)?;
 
-    // Format negotiation — accept multiple formats with ranges, exactly like
-    // the pipewire-rs streams.rs example. This lets PipeWire pick the best
-    // SHM-compatible format instead of forcing DmaBuf.
     let obj = spa::pod::object!(
         spa::utils::SpaTypes::ObjectParamFormat,
         spa::param::ParamType::EnumFormat,
@@ -112,7 +104,7 @@ fn run_capture_loop(
             spa::param::video::VideoFormat::BGRx,
             spa::param::video::VideoFormat::RGBA,
             spa::param::video::VideoFormat::RGBx,
-            spa::param::video::VideoFormat::RGB,
+            spa::param::video::VideoFormat::RGB
         ),
         spa::pod::property!(
             spa::param::format::FormatProperties::VideoSize,
@@ -128,9 +120,9 @@ fn run_capture_loop(
             Choice,
             Range,
             Fraction,
-            spa::utils::Fraction { num: 30, denom: 1 },
+            spa::utils::Fraction { num: if fps > 0 { fps } else { 0 }, denom: 1 },
             spa::utils::Fraction { num: 0, denom: 1 },
-            spa::utils::Fraction { num: 144, denom: 1 }
+            spa::utils::Fraction { num: 1000, denom: 1 }
         ),
     );
 
@@ -144,47 +136,50 @@ fn run_capture_loop(
 
     let mut params = [Pod::from_bytes(&values).unwrap()];
 
-    let frame_ref = latest_frame;
     let process_count = Arc::new(AtomicU64::new(0));
     let pc = process_count.clone();
 
     let _listener = stream
         .add_local_listener_with_user_data(())
+        .param_changed(|_, _, id, param| {
+            if let Some(param) = param {
+                if id == spa::param::ParamType::Format.as_raw() {
+                    let mut vinfo = spa::param::video::VideoInfoRaw::default();
+                    if vinfo.parse(param).is_ok() {
+                        eprintln!("pipecap: negotiated {:?} {}x{} {}/{}fps",
+                            vinfo.format(),
+                            vinfo.size().width, vinfo.size().height,
+                            vinfo.framerate().num, vinfo.framerate().denom);
+                    }
+                }
+            }
+        })
         .process(move |stream_ref, _| {
             let n = pc.fetch_add(1, Ordering::Relaxed);
             match stream_ref.dequeue_buffer() {
-                None => {
-                    if n < 3 { eprintln!("pipecap: out of buffers"); }
-                }
+                None => {}
                 Some(mut buffer) => {
                     let datas = buffer.datas_mut();
                     if let Some(data) = datas.first_mut() {
                         let chunk = data.chunk();
                         let size = chunk.size() as usize;
                         let stride = chunk.stride();
-                        let offset = chunk.offset() as usize;
-
-                        if n < 3 {
-                            eprintln!("pipecap: frame #{n} size={size} stride={stride} type={:?}", data.type_());
-                        }
 
                         if size > 0 && stride > 0 {
+                            let offset = chunk.offset() as usize;
                             let bpp = 4u32;
                             let w = stride as u32 / bpp;
                             let h = size as u32 / stride as u32;
 
                             if let Some(slice) = data.data() {
                                 if offset + size <= slice.len() && w > 0 && h > 0 {
-                                    if let Ok(mut lock) = frame_ref.lock() {
-                                        *lock = Some(RawFrame {
-                                            width: w,
-                                            height: h,
-                                            data: slice[offset..offset + size].to_vec(),
-                                        });
-                                    }
+                                    // Write directly to shared memory — no Vec allocation
+                                    shm.write_frame(w, h, stride as u32, &slice[offset..offset + size]);
                                 }
-                            } else if n < 3 {
-                                eprintln!("pipecap: data() returned None (type={:?})", data.type_());
+                            }
+
+                            if n < 3 {
+                                eprintln!("pipecap: frame #{n} {w}x{h} stride={stride} type={:?}", data.type_());
                             }
                         }
                     }
