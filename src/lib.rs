@@ -43,6 +43,7 @@ pub struct Frame {
 pub struct AudioChunk {
     pub channels: u32,
     pub sample_rate: u32,
+    /// Interleaved f32 PCM samples as little-endian bytes.
     pub data: napi::bindgen_prelude::Buffer,
 }
 
@@ -73,21 +74,36 @@ pub async fn show_picker(source_types: u32) -> Result<Option<Vec<PortalStream>>>
     }
 }
 
-// ── Video Capture ───────────────────────────────────
+// ── Capture ─────────────────────────────────────────
 
-/// Start capturing video frames from a PipeWire node.
-/// The node_id must come from show_picker() (portal-consented).
+/// Start capturing from a PipeWire node.
+/// `node_id` must come from show_picker() (portal-consented).
+/// If `audio` is true, also captures system audio from the default output.
+/// `exclude_pid` is used to prevent audio feedback (pass your own PID).
 #[napi]
-pub fn start_capture(node_id: u32, width: u32, height: u32) -> Result<()> {
-    let mut lock = CAPTURER
-        .lock()
-        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
-    if lock.is_some() {
+pub fn start_capture(node_id: u32, width: u32, height: u32, audio: bool, exclude_pid: Option<u32>) -> Result<()> {
+    // Video
+    {
+        let mut lock = CAPTURER
+            .lock()
+            .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
         lock.take();
+        let capturer = capture::Capturer::new(node_id, width, height)
+            .map_err(|e| Error::new(Status::GenericFailure, format!("capture error: {e}")))?;
+        *lock = Some(capturer);
     }
-    let capturer = capture::Capturer::new(node_id, width, height)
-        .map_err(|e| Error::new(Status::GenericFailure, format!("capture error: {e}")))?;
-    *lock = Some(capturer);
+
+    // Audio (optional)
+    if audio {
+        let mut lock = AUDIO_CAPTURER
+            .lock()
+            .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
+        lock.take();
+        let capturer = audio::AudioCapturer::new(exclude_pid.unwrap_or(0))
+            .map_err(|e| Error::new(Status::GenericFailure, format!("audio capture error: {e}")))?;
+        *lock = Some(capturer);
+    }
+
     Ok(())
 }
 
@@ -110,47 +126,18 @@ pub fn read_frame() -> Result<Option<Frame>> {
     }
 }
 
-/// Stop video capture and release PipeWire resources.
-#[napi]
-pub fn stop_capture() {
-    if let Ok(mut lock) = CAPTURER.lock() {
-        lock.take();
-    }
-}
-
-// ── Audio Capture ───────────────────────────────────
-
-/// Start capturing system audio via PipeWire.
-/// Captures from the default audio output (monitor).
-/// `exclude_pid`: PID of the current process to exclude from capture (prevents feedback).
-#[napi]
-pub fn start_audio_capture(exclude_pid: u32) -> Result<()> {
-    let mut lock = AUDIO_CAPTURER
-        .lock()
-        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
-    if lock.is_some() {
-        lock.take();
-    }
-    let capturer = audio::AudioCapturer::new(exclude_pid)
-        .map_err(|e| Error::new(Status::GenericFailure, format!("audio capture error: {e}")))?;
-    *lock = Some(capturer);
-    Ok(())
-}
-
-/// Read accumulated audio samples. Returns null if no audio available.
-/// Audio is interleaved f32 PCM (typically stereo 48kHz).
-/// The buffer is drained on each call.
+/// Read accumulated audio samples. Returns null if no audio available or audio not enabled.
+/// Audio is interleaved f32 PCM (typically stereo 48kHz). Buffer is drained on each call.
 #[napi]
 pub fn read_audio() -> Result<Option<AudioChunk>> {
     let lock = AUDIO_CAPTURER
         .lock()
         .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
     match lock.as_ref() {
-        None => Err(Error::new(Status::GenericFailure, "not capturing audio")),
+        None => Ok(None), // Audio not enabled — not an error
         Some(cap) => match cap.read_audio() {
             None => Ok(None),
             Some(buf) => {
-                // Convert f32 samples to bytes for the Buffer
                 let bytes: Vec<u8> = buf
                     .data
                     .iter()
@@ -166,9 +153,12 @@ pub fn read_audio() -> Result<Option<AudioChunk>> {
     }
 }
 
-/// Stop audio capture.
+/// Stop all capture (video + audio) and release PipeWire resources.
 #[napi]
-pub fn stop_audio_capture() {
+pub fn stop_capture() {
+    if let Ok(mut lock) = CAPTURER.lock() {
+        lock.take();
+    }
     if let Ok(mut lock) = AUDIO_CAPTURER.lock() {
         lock.take();
     }

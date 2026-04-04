@@ -28,10 +28,12 @@ export interface AudioChunk {
 export function showPicker(sourceTypes: number): Promise<PortalStream[] | null>
 
 /**
- * Start capturing video frames from a PipeWire node.
- * The nodeId must come from showPicker() (portal-consented).
+ * Start capturing from a PipeWire node.
+ * `nodeId` must come from showPicker() (portal-consented).
+ * If `audio` is true, also captures system audio from the default output.
+ * `excludePid`: PID of the current process to prevent audio feedback.
  */
-export function startCapture(nodeId: number, width: number, height: number): void
+export function startCapture(nodeId: number, width: number, height: number, audio: boolean, excludePid?: number): void
 
 /**
  * Read the latest video frame. Returns null if no frame is available yet.
@@ -39,25 +41,12 @@ export function startCapture(nodeId: number, width: number, height: number): voi
 export function readFrame(): Frame | null
 
 /**
- * Stop video capture and release PipeWire resources.
- */
-export function stopCapture(): void
-
-/**
- * Start capturing system audio via PipeWire.
- * Captures from the default audio output (monitor).
- * `excludePid`: PID of the current process to prevent feedback.
- */
-export function startAudioCapture(excludePid: number): void
-
-/**
- * Read accumulated audio samples. Returns null if no audio available.
- * Audio is interleaved f32 PCM (typically stereo 48kHz).
- * The buffer is drained on each call.
+ * Read accumulated audio samples. Returns null if no audio available or audio not enabled.
+ * Audio is interleaved f32 PCM (typically stereo 48kHz). Buffer is drained on each call.
  */
 export function readAudio(): AudioChunk | null
 
 /**
- * Stop audio capture.
+ * Stop all capture (video + audio) and release PipeWire resources.
  */
-export function stopAudioCapture(): void
+export function stopCapture(): void
