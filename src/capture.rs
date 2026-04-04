@@ -175,11 +175,17 @@ fn run_capture_loop(
 
                             if let Some(slice) = data.data() {
                                 if offset + size <= slice.len() && w > 0 && h > 0 {
+                                    // Convert BGRx/BGRA → RGBA by swapping R and B channels
+                                    let src = &slice[offset..offset + size];
+                                    let mut rgba = src.to_vec();
+                                    for pixel in rgba.chunks_exact_mut(4) {
+                                        pixel.swap(0, 2); // B↔R
+                                    }
                                     if let Ok(mut lock) = frame_ref.lock() {
                                         *lock = Some(RawFrame {
                                             width: w,
                                             height: h,
-                                            data: slice[offset..offset + size].to_vec(),
+                                            data: rgba,
                                         });
                                     }
                                 }
