@@ -26,7 +26,7 @@ pub struct Capturer {
 impl Capturer {
     /// Create a new capturer for the given PipeWire node.
     /// The node_id must come from a portal session (user-consented).
-    pub fn new(node_id: u32, _width: u32, _height: u32) -> anyhow::Result<Self> {
+    pub fn new(node_id: u32, _width: u32, _height: u32, fps: u32) -> anyhow::Result<Self> {
         let latest_frame: Arc<Mutex<Option<RawFrame>>> = Arc::new(Mutex::new(None));
         let stop_flag = Arc::new(AtomicBool::new(false));
 
@@ -34,7 +34,7 @@ impl Capturer {
         let stop_ref = stop_flag.clone();
 
         let thread = std::thread::spawn(move || {
-            if let Err(e) = run_capture_loop(node_id, frame_ref, stop_ref) {
+            if let Err(e) = run_capture_loop(node_id, fps, frame_ref, stop_ref) {
                 eprintln!("pipecap: capture loop error: {e}");
             }
         });
@@ -69,6 +69,7 @@ impl Drop for Capturer {
 /// The actual PipeWire event loop, runs on a background thread.
 fn run_capture_loop(
     node_id: u32,
+    _fps: u32,
     latest_frame: Arc<Mutex<Option<RawFrame>>>,
     stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {

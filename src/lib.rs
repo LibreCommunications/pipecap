@@ -76,30 +76,40 @@ pub async fn show_picker(source_types: u32) -> Result<Option<Vec<PortalStream>>>
 
 // ── Capture ─────────────────────────────────────────
 
+/// Capture options.
+#[napi(object)]
+pub struct CaptureOptions {
+    pub node_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub audio: bool,
+    /// PID of the current process — used to exclude own audio output from capture.
+    pub exclude_pid: Option<u32>,
+}
+
 /// Start capturing from a PipeWire node.
 /// `node_id` must come from show_picker() (portal-consented).
-/// If `audio` is true, also captures system audio from the default output.
-/// `exclude_pid` is used to prevent audio feedback (pass your own PID).
 #[napi]
-pub fn start_capture(node_id: u32, width: u32, height: u32, audio: bool, exclude_pid: Option<u32>) -> Result<()> {
+pub fn start_capture(options: CaptureOptions) -> Result<()> {
     // Video
     {
         let mut lock = CAPTURER
             .lock()
             .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
         lock.take();
-        let capturer = capture::Capturer::new(node_id, width, height)
+        let capturer = capture::Capturer::new(options.node_id, options.width, options.height, options.fps)
             .map_err(|e| Error::new(Status::GenericFailure, format!("capture error: {e}")))?;
         *lock = Some(capturer);
     }
 
     // Audio (optional)
-    if audio {
+    if options.audio {
         let mut lock = AUDIO_CAPTURER
             .lock()
             .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
         lock.take();
-        let capturer = audio::AudioCapturer::new(exclude_pid.unwrap_or(0))
+        let capturer = audio::AudioCapturer::new(options.exclude_pid.unwrap_or(0))
             .map_err(|e| Error::new(Status::GenericFailure, format!("audio capture error: {e}")))?;
         *lock = Some(capturer);
     }

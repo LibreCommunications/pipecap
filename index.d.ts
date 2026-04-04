@@ -7,6 +7,16 @@ export interface PortalStream {
   height: number
 }
 
+export interface CaptureOptions {
+  nodeId: number
+  width: number
+  height: number
+  fps: number
+  audio: boolean
+  /** PID of the current process — used to exclude own audio output from capture. */
+  excludePid?: number
+}
+
 export interface Frame {
   width: number
   height: number
@@ -31,9 +41,8 @@ export function showPicker(sourceTypes: number): Promise<PortalStream[] | null>
  * Start capturing from a PipeWire node.
  * `nodeId` must come from showPicker() (portal-consented).
  * If `audio` is true, also captures system audio from the default output.
- * `excludePid`: PID of the current process to prevent audio feedback.
  */
-export function startCapture(nodeId: number, width: number, height: number, audio: boolean, excludePid?: number): void
+export function startCapture(options: CaptureOptions): void
 
 /**
  * Read the latest video frame. Returns null if no frame is available yet.
