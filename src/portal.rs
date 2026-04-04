@@ -1,8 +1,10 @@
 //! xdg-desktop-portal ScreenCast client via ashpd.
-//! Shows the native Wayland screen/window picker and returns PipeWire stream info.
+//! Shows the native Wayland screen/window picker and returns PipeWire stream info
+//! along with the PipeWire remote fd for connecting to the portal's stream.
 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::PersistMode;
+use std::os::fd::{OwnedFd, IntoRawFd};
 
 /// Result from the portal's Start method.
 pub struct StreamInfo {
@@ -12,10 +14,15 @@ pub struct StreamInfo {
     pub height: i32,
 }
 
+pub struct PortalResult {
+    pub streams: Vec<StreamInfo>,
+    /// Raw fd to the PipeWire remote — pass to pw_context_connect_fd
+    pub pipewire_fd: i32,
+}
+
 /// Show the native screen picker via xdg-desktop-portal.
-/// `source_types` is a bitmask: 1=MONITOR, 2=WINDOW, 3=BOTH.
-/// Returns None if the user cancelled.
-pub async fn request_screen_cast(_source_types: u32) -> anyhow::Result<Option<Vec<StreamInfo>>> {
+/// Returns the streams + PipeWire remote fd, or None if cancelled.
+pub async fn request_screen_cast(_source_types: u32) -> anyhow::Result<Option<PortalResult>> {
     let proxy = Screencast::new().await?;
     let session = proxy.create_session().await?;
 
@@ -26,8 +33,8 @@ pub async fn request_screen_cast(_source_types: u32) -> anyhow::Result<Option<Ve
             &session,
             CursorMode::Embedded,
             st,
-            false, // multiple
-            None,  // restore_token
+            false,
+            None,
             PersistMode::DoNot,
         )
         .await?;
@@ -42,8 +49,12 @@ pub async fn request_screen_cast(_source_types: u32) -> anyhow::Result<Option<Ve
         return Ok(None);
     }
 
-    Ok(Some(
-        streams
+    // Get the PipeWire remote fd — this is how we connect to the portal's stream
+    let pw_fd: OwnedFd = proxy.open_pipe_wire_remote(&session).await?;
+    let raw_fd = pw_fd.into_raw_fd();
+
+    Ok(Some(PortalResult {
+        streams: streams
             .iter()
             .map(|s| {
                 let (w, h) = s.size().unwrap_or((0, 0));
@@ -59,5 +70,6 @@ pub async fn request_screen_cast(_source_types: u32) -> anyhow::Result<Option<Ve
                 }
             })
             .collect(),
-    ))
+        pipewire_fd: raw_fd,
+    }))
 }

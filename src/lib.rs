@@ -9,18 +9,6 @@ use std::sync::Mutex;
 static CAPTURER: Mutex<Option<capture::Capturer>> = Mutex::new(None);
 static AUDIO_CAPTURER: Mutex<Option<audio::AudioCapturer>> = Mutex::new(None);
 
-// Tokio runtime for async portal calls
-static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-
-fn get_runtime() -> &'static tokio::runtime::Runtime {
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create tokio runtime")
-    })
-}
-
 /// Stream info returned by the portal picker.
 #[napi(object)]
 pub struct PortalStream {
@@ -52,17 +40,25 @@ pub struct AudioChunk {
 /// Show the native xdg-desktop-portal screen/window picker.
 /// `source_types`: 1=monitors, 2=windows, 3=both.
 /// Returns the selected stream(s), or null if the user cancelled.
+/// Result from the portal picker — streams + PipeWire remote fd.
+#[napi(object)]
+pub struct PickerResult {
+    pub streams: Vec<PortalStream>,
+    /// Raw fd to the PipeWire remote. Pass this to startCapture.
+    pub pipewire_fd: i32,
+}
+
 #[napi]
-pub async fn show_picker(source_types: u32) -> Result<Option<Vec<PortalStream>>> {
-    let rt = get_runtime();
-    let streams = rt
-        .block_on(portal::request_screen_cast(source_types))
+pub async fn show_picker(source_types: u32) -> Result<Option<PickerResult>> {
+    let result = portal::request_screen_cast(source_types)
+        .await
         .map_err(|e| Error::new(Status::GenericFailure, format!("portal error: {e}")))?;
 
-    match streams {
+    match result {
         None => Ok(None),
-        Some(s) => Ok(Some(
-            s.into_iter()
+        Some(r) => Ok(Some(PickerResult {
+            streams: r.streams
+                .into_iter()
                 .map(|st| PortalStream {
                     node_id: st.node_id,
                     source_type: st.source_type,
@@ -70,7 +66,8 @@ pub async fn show_picker(source_types: u32) -> Result<Option<Vec<PortalStream>>>
                     height: st.height,
                 })
                 .collect(),
-        )),
+            pipewire_fd: r.pipewire_fd,
+        })),
     }
 }
 
@@ -80,6 +77,8 @@ pub async fn show_picker(source_types: u32) -> Result<Option<Vec<PortalStream>>>
 #[napi(object)]
 pub struct CaptureOptions {
     pub node_id: u32,
+    /// PipeWire remote fd from showPicker().
+    pub pipewire_fd: i32,
     pub fps: u32,
     pub audio: bool,
     /// PID of the current process — used to exclude own audio output from capture.
@@ -96,7 +95,7 @@ pub fn start_capture(options: CaptureOptions) -> Result<()> {
             .lock()
             .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
         lock.take();
-        let capturer = capture::Capturer::new(options.node_id, options.fps)
+        let capturer = capture::Capturer::new(options.node_id, options.pipewire_fd, options.fps)
             .map_err(|e| Error::new(Status::GenericFailure, format!("capture error: {e}")))?;
         *lock = Some(capturer);
     }

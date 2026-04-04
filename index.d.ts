@@ -27,11 +27,19 @@ export interface AudioChunk {
  * Show the native xdg-desktop-portal screen/window picker.
  * `source_types`: 1=monitors, 2=windows, 3=both.
  * Returns the selected stream(s), or null if the user cancelled.
+ * Result from the portal picker — streams + PipeWire remote fd.
  */
-export declare function showPicker(sourceTypes: number): Promise<Array<PortalStream> | null>
+export interface PickerResult {
+  streams: Array<PortalStream>
+  /** Raw fd to the PipeWire remote. Pass this to startCapture. */
+  pipewireFd: number
+}
+export declare function showPicker(sourceTypes: number): Promise<PickerResult | null>
 /** Capture options. */
 export interface CaptureOptions {
   nodeId: number
+  /** PipeWire remote fd from showPicker(). */
+  pipewireFd: number
   fps: number
   audio: boolean
   /** PID of the current process — used to exclude own audio output from capture. */

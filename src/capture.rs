@@ -1,23 +1,21 @@
 //! PipeWire video stream consumer.
-//! Opens a PipeWire stream for a given node ID and captures video frames
-//! on a background thread. Negotiates the requested resolution and frame rate.
+//! Connects to a portal's PipeWire remote and captures video frames.
 
 use pipewire as pw;
-use libspa::pod::builder::Builder;
+use pw::spa;
+use spa::pod::Pod;
+use std::os::fd::{OwnedFd, FromRawFd};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
-/// Raw frame data.
 pub struct RawFrame {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
 }
 
-/// PipeWire video capturer. Runs the PipeWire main loop on a background
-/// thread and stores the latest frame for the caller to read.
 pub struct Capturer {
     latest_frame: Arc<Mutex<Option<RawFrame>>>,
     stop_flag: Arc<AtomicBool>,
@@ -25,7 +23,7 @@ pub struct Capturer {
 }
 
 impl Capturer {
-    pub fn new(node_id: u32, fps: u32) -> anyhow::Result<Self> {
+    pub fn new(node_id: u32, pipewire_fd: i32, _fps: u32) -> anyhow::Result<Self> {
         let latest_frame: Arc<Mutex<Option<RawFrame>>> = Arc::new(Mutex::new(None));
         let stop_flag = Arc::new(AtomicBool::new(false));
 
@@ -33,7 +31,7 @@ impl Capturer {
         let stop_ref = stop_flag.clone();
 
         let thread = std::thread::spawn(move || {
-            if let Err(e) = run_capture_loop(node_id, fps, frame_ref, stop_ref) {
+            if let Err(e) = run_capture_loop(node_id, pipewire_fd, frame_ref, stop_ref) {
                 eprintln!("pipecap: capture loop error: {e}");
             }
         });
@@ -68,36 +66,9 @@ impl Drop for Capturer {
     }
 }
 
-/// Build a SPA pod requesting a specific video format, resolution, and fps.
-fn build_video_format_pod(buf: &mut Vec<u8>, fps: u32) {
-    use libspa::param::{ParamType, format::{FormatProperties, MediaType, MediaSubtype}};
-    use libspa::param::video::VideoFormat;
-    use libspa::utils::{Fraction, Id};
-
-    let mut builder = Builder::new(buf);
-    // Request RGBA format at the source's native resolution, capped at the given fps.
-    // No size constraint — PipeWire delivers at the portal source's native resolution.
-    let _ = libspa::pod::builder::builder_add!(
-        &mut builder,
-        Object(
-            ParamType::EnumFormat.as_raw(),
-            0,
-        ) {
-            FormatProperties::MediaType.as_raw() =>
-                Id(Id(MediaType::Video.as_raw())),
-            FormatProperties::MediaSubtype.as_raw() =>
-                Id(Id(MediaSubtype::Raw.as_raw())),
-            FormatProperties::VideoFormat.as_raw() =>
-                Id(Id(VideoFormat::RGBA.as_raw())),
-            FormatProperties::VideoFramerate.as_raw() =>
-                Fraction(Fraction { num: fps, denom: 1 }),
-        }
-    );
-}
-
 fn run_capture_loop(
     node_id: u32,
-    fps: u32,
+    pipewire_fd: i32,
     latest_frame: Arc<Mutex<Option<RawFrame>>>,
     stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -105,7 +76,10 @@ fn run_capture_loop(
 
     let mainloop = pw::main_loop::MainLoopBox::new(None)?;
     let context = pw::context::ContextBox::new(mainloop.loop_(), None)?;
-    let core = context.connect(None)?;
+
+    let fd = unsafe { OwnedFd::from_raw_fd(pipewire_fd) };
+    let core = context.connect_fd(fd, None)?;
+    eprintln!("pipecap: connected to PipeWire remote via fd {pipewire_fd}");
 
     let mut props = pw::properties::PropertiesBox::new();
     props.insert(*pw::keys::MEDIA_TYPE, "Video");
@@ -113,34 +87,104 @@ fn run_capture_loop(
     props.insert(*pw::keys::MEDIA_ROLE, "Screen");
     let stream = pw::stream::StreamBox::new(&core, "pipecap-video", props)?;
 
+    // Format negotiation — accept multiple formats with ranges, exactly like
+    // the pipewire-rs streams.rs example. This lets PipeWire pick the best
+    // SHM-compatible format instead of forcing DmaBuf.
+    let obj = spa::pod::object!(
+        spa::utils::SpaTypes::ObjectParamFormat,
+        spa::param::ParamType::EnumFormat,
+        spa::pod::property!(
+            spa::param::format::FormatProperties::MediaType,
+            Id,
+            spa::param::format::MediaType::Video
+        ),
+        spa::pod::property!(
+            spa::param::format::FormatProperties::MediaSubtype,
+            Id,
+            spa::param::format::MediaSubtype::Raw
+        ),
+        spa::pod::property!(
+            spa::param::format::FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            spa::param::video::VideoFormat::BGRx,
+            spa::param::video::VideoFormat::BGRx,
+            spa::param::video::VideoFormat::RGBA,
+            spa::param::video::VideoFormat::RGBx,
+            spa::param::video::VideoFormat::RGB,
+        ),
+        spa::pod::property!(
+            spa::param::format::FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            spa::utils::Rectangle { width: 1920, height: 1080 },
+            spa::utils::Rectangle { width: 1, height: 1 },
+            spa::utils::Rectangle { width: 7680, height: 4320 }
+        ),
+        spa::pod::property!(
+            spa::param::format::FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            spa::utils::Fraction { num: 30, denom: 1 },
+            spa::utils::Fraction { num: 0, denom: 1 },
+            spa::utils::Fraction { num: 144, denom: 1 }
+        ),
+    );
+
+    let values: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &spa::pod::Value::Object(obj),
+    )
+    .unwrap()
+    .0
+    .into_inner();
+
+    let mut params = [Pod::from_bytes(&values).unwrap()];
+
     let frame_ref = latest_frame;
+    let process_count = Arc::new(AtomicU64::new(0));
+    let pc = process_count.clone();
 
     let _listener = stream
         .add_local_listener_with_user_data(())
-        .process(move |stream_ref, _user_data| {
-            if let Some(mut buffer) = stream_ref.dequeue_buffer() {
-                let datas = buffer.datas_mut();
-                if let Some(data) = datas.first_mut() {
-                    let chunk = data.chunk();
-                    let size = chunk.size() as usize;
-                    let offset = chunk.offset() as usize;
-                    let stride = chunk.stride();
+        .process(move |stream_ref, _| {
+            let n = pc.fetch_add(1, Ordering::Relaxed);
+            match stream_ref.dequeue_buffer() {
+                None => {
+                    if n < 3 { eprintln!("pipecap: out of buffers"); }
+                }
+                Some(mut buffer) => {
+                    let datas = buffer.datas_mut();
+                    if let Some(data) = datas.first_mut() {
+                        let chunk = data.chunk();
+                        let size = chunk.size() as usize;
+                        let stride = chunk.stride();
+                        let offset = chunk.offset() as usize;
 
-                    if let Some(slice) = data.data() {
-                        if size > 0 && offset + size <= slice.len() && stride > 0 {
-                            let pixels = &slice[offset..offset + size];
+                        if n < 3 {
+                            eprintln!("pipecap: frame #{n} size={size} stride={stride} type={:?}", data.type_());
+                        }
+
+                        if size > 0 && stride > 0 {
                             let bpp = 4u32;
                             let w = stride as u32 / bpp;
                             let h = size as u32 / stride as u32;
 
-                            if w > 0 && h > 0 {
-                                if let Ok(mut lock) = frame_ref.lock() {
-                                    *lock = Some(RawFrame {
-                                        width: w,
-                                        height: h,
-                                        data: pixels.to_vec(),
-                                    });
+                            if let Some(slice) = data.data() {
+                                if offset + size <= slice.len() && w > 0 && h > 0 {
+                                    if let Ok(mut lock) = frame_ref.lock() {
+                                        *lock = Some(RawFrame {
+                                            width: w,
+                                            height: h,
+                                            data: slice[offset..offset + size].to_vec(),
+                                        });
+                                    }
                                 }
+                            } else if n < 3 {
+                                eprintln!("pipecap: data() returned None (type={:?})", data.type_());
                             }
                         }
                     }
@@ -149,20 +193,14 @@ fn run_capture_loop(
         })
         .register()?;
 
-    // Build format parameters — request specific resolution and fps
-    let mut format_buf = Vec::new();
-    build_video_format_pod(&mut format_buf, fps);
-
-    // Safety: the pod data lives in format_buf which outlives the connect call
-    let pod = unsafe { &*(format_buf.as_ptr() as *const libspa::pod::Pod) };
-    let mut params = [pod];
-
     stream.connect(
-        libspa::utils::Direction::Input,
+        spa::utils::Direction::Input,
         Some(node_id),
         pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
         &mut params,
     )?;
+
+    eprintln!("pipecap: stream connected to node {node_id}");
 
     let mainloop_ptr = mainloop.as_raw_ptr();
     let timer = mainloop.loop_().add_timer(move |_| {

@@ -22,6 +22,9 @@ libspa = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs.git" }
 ashpd = { version = "0.10", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 
+# System
+libc = "0.2"
+
 # Error handling
 anyhow = "1"
 
