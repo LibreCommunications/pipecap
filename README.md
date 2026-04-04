@@ -71,6 +71,14 @@ npm install
 npm run build
 ```
 
+## Acknowledgements
+
+This project is built on the work of:
+
+- [**ashpd**](https://github.com/bilelmoussaoui/ashpd) by Bilal Elmoussaoui — Rust wrapper for xdg-desktop-portal that makes the portal API accessible and safe. This is what powers the native screen picker.
+- [**pipewire-rs**](https://gitlab.freedesktop.org/pipewire/pipewire-rs) by Tom Wagner and Guillaume Desmottes — Rust bindings for PipeWire that make it possible to consume video streams natively.
+- [**napi-rs**](https://napi.rs) by LongYinan — the bridge that turns Rust into a Node.js native addon.
+
 ## License
 
 [AGPL-3.0](LICENSE)
