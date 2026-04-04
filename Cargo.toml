@@ -1,0 +1,35 @@
+[package]
+name = "pipecap"
+version = "0.1.0"
+edition = "2024"
+description = "Native PipeWire screen capture for Electron — portal picker + video frames"
+license = "AGPL-3.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Node.js native addon
+napi = { version = "2", features = ["async", "napi8"] }
+napi-derive = "2"
+
+# PipeWire client
+pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs.git" }
+libspa = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs.git" }
+
+# D-Bus for xdg-desktop-portal
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+
+# Frame handling
+serde = { version = "1", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+strip = true

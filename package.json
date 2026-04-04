@@ -1,0 +1,26 @@
+{
+  "name": "pipecap",
+  "version": "0.1.0",
+  "description": "Native PipeWire screen capture for Electron — portal picker + video frames",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "AGPL-3.0",
+  "os": ["linux"],
+  "napi": {
+    "name": "pipecap",
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2"
+  }
+}
