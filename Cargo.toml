@@ -13,16 +13,14 @@ crate-type = ["cdylib"]
 napi = { version = "2", features = ["async", "napi8"] }
 napi-derive = "2"
 
-# PipeWire client
+# PipeWire client (git for PipeWire 1.6 compat)
 pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs.git" }
+pipewire-sys = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs.git" }
 libspa = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs.git" }
 
-# D-Bus for xdg-desktop-portal
-zbus = { version = "5", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
-
-# Frame handling
-serde = { version = "1", features = ["derive"] }
+# xdg-desktop-portal (ScreenCast)
+ashpd = { version = "0.10", features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 
 # Error handling
 anyhow = "1"

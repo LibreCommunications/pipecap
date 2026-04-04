@@ -7,6 +7,18 @@ use std::sync::Mutex;
 
 static CAPTURER: Mutex<Option<capture::Capturer>> = Mutex::new(None);
 
+// Tokio runtime for async portal calls
+static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+fn get_runtime() -> &'static tokio::runtime::Runtime {
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create tokio runtime")
+    })
+}
+
 /// Stream info returned by the portal picker.
 #[napi(object)]
 pub struct PortalStream {
@@ -16,7 +28,7 @@ pub struct PortalStream {
     pub height: i32,
 }
 
-/// A single RGBA video frame.
+/// A single video frame (RGBA pixels).
 #[napi(object)]
 pub struct Frame {
     pub width: u32,
@@ -25,11 +37,13 @@ pub struct Frame {
 }
 
 /// Show the native xdg-desktop-portal screen/window picker.
+/// `source_types`: 1=monitors, 2=windows, 3=both.
 /// Returns the selected stream(s), or null if the user cancelled.
 #[napi]
 pub async fn show_picker(source_types: u32) -> Result<Option<Vec<PortalStream>>> {
-    let streams = portal::request_screen_cast(source_types)
-        .await
+    let rt = get_runtime();
+    let streams = rt
+        .block_on(portal::request_screen_cast(source_types))
         .map_err(|e| Error::new(Status::GenericFailure, format!("portal error: {e}")))?;
 
     match streams {
@@ -48,11 +62,14 @@ pub async fn show_picker(source_types: u32) -> Result<Option<Vec<PortalStream>>>
 }
 
 /// Start capturing video frames from a PipeWire node.
+/// The node_id must come from show_picker() (portal-consented).
 #[napi]
 pub fn start_capture(node_id: u32, width: u32, height: u32) -> Result<()> {
-    let mut lock = CAPTURER.lock().map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
+    let mut lock = CAPTURER
+        .lock()
+        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
     if lock.is_some() {
-        lock.take();
+        lock.take(); // Stop previous capture
     }
     let capturer = capture::Capturer::new(node_id, width, height)
         .map_err(|e| Error::new(Status::GenericFailure, format!("capture error: {e}")))?;
@@ -63,7 +80,9 @@ pub fn start_capture(node_id: u32, width: u32, height: u32) -> Result<()> {
 /// Read the latest video frame. Returns null if no frame is available yet.
 #[napi]
 pub fn read_frame() -> Result<Option<Frame>> {
-    let lock = CAPTURER.lock().map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
+    let lock = CAPTURER
+        .lock()
+        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
     match lock.as_ref() {
         None => Err(Error::new(Status::GenericFailure, "not capturing")),
         Some(cap) => match cap.read_frame() {
@@ -77,7 +96,7 @@ pub fn read_frame() -> Result<Option<Frame>> {
     }
 }
 
-/// Stop capturing.
+/// Stop capturing and release PipeWire resources.
 #[napi]
 pub fn stop_capture() {
     if let Ok(mut lock) = CAPTURER.lock() {
