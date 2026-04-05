@@ -5,7 +5,7 @@
 
 export interface PortalStream {
   nodeId: number
-  /** 1=monitor, 2=window */
+  /** 1 = monitor, 2 = window. */
   sourceType: number
   width: number
   height: number
@@ -19,32 +19,40 @@ export interface CaptureOptions {
   pipewireFd: number
   fps: number
   audio: boolean
-  /**
-   * 1=monitor, 2=window. Determines audio mode:
-   * monitor → system audio (sink monitor),
-   * window → per-app audio (auto-detected from video node).
-   */
+  /** 1 = monitor, 2 = window. */
   sourceType: number
 }
-export interface ShmInfo {
+export interface CaptureInfo {
   shmPath: string
   shmSize: number
   headerSize: number
+  width: number
+  height: number
+  /** Auto-detected app name, or null if undetectable. */
+  detectedApp?: string
 }
 export interface AudioChunk {
   channels: number
   sampleRate: number
   data: Buffer
 }
-/**
- * Show the native xdg-desktop-portal screen/window picker.
- * `sourceTypes`: 1=monitors, 2=windows, 3=both.
- */
+export interface AudioAppInfo {
+  name: string
+  binary: string
+}
 export declare function showPicker(sourceTypes: number): Promise<PickerResult | null>
-/** Start video + optional audio capture. Returns shared memory info. */
-export declare function startCapture(options: CaptureOptions): ShmInfo
-/** Read accumulated audio samples (interleaved f32 PCM). Returns null if none available. */
+/**
+ * Start capture. Auto-detects audio target for window captures.
+ * Returns `detectedApp` so the frontend knows whether to show a picker.
+ */
+export declare function startCapture(options: CaptureOptions): CaptureInfo
+/**
+ * Switch audio target at runtime. Recreates the audio capturer.
+ * `target`: "system", "none", or an app name.
+ */
+export declare function setAudioTarget(target: string): void
+/** List applications currently producing audio. */
+export declare function listAudioApps(): Array<AudioAppInfo>
 export declare function readAudio(): AudioChunk | null
 export declare function isCapturing(): boolean
-/** Stop all capture (video + audio) and release resources. */
 export declare function stopCapture(): void

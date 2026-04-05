@@ -97,8 +97,37 @@ fn create_stream(
     Ok(LiveStream { _stream: stream, _listener: listener })
 }
 
+/// Per-app capture resolved from a portal video node.
 pub fn run(
     video_node_id: u32,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    channels_out: Arc<Mutex<u32>>,
+    sample_rate_out: Arc<Mutex<u32>>,
+    stop_flag: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    let matcher = resolve::resolve_session_matcher(video_node_id);
+    match &matcher {
+        Some(m) => eprintln!("pipecap-audio: matcher={:?}", m),
+        None => eprintln!("pipecap-audio: no matcher found, will watch all new audio nodes"),
+    }
+    run_with_matcher(matcher, buffer, channels_out, sample_rate_out, stop_flag)
+}
+
+/// Per-app capture by explicit app name (from setAudioTarget).
+pub fn run_by_name(
+    app_name: String,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    channels_out: Arc<Mutex<u32>>,
+    sample_rate_out: Arc<Mutex<u32>>,
+    stop_flag: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    let matcher = Some(resolve::SessionMatcher::AppName(app_name));
+    eprintln!("pipecap-audio: matcher={:?}", matcher.as_ref().unwrap());
+    run_with_matcher(matcher, buffer, channels_out, sample_rate_out, stop_flag)
+}
+
+fn run_with_matcher(
+    matcher: Option<resolve::SessionMatcher>,
     buffer: Arc<Mutex<Vec<f32>>>,
     channels_out: Arc<Mutex<u32>>,
     sample_rate_out: Arc<Mutex<u32>>,
@@ -109,12 +138,6 @@ pub fn run(
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
-
-    let matcher = resolve::resolve_session_matcher(video_node_id);
-    match &matcher {
-        Some(m) => eprintln!("pipecap-audio: matcher={:?}", m),
-        None => eprintln!("pipecap-audio: no matcher found, will watch all new audio nodes"),
-    }
 
     // Current live stream — replaced each time a new matching node appears
     let live: Rc<RefCell<Option<LiveStream>>> = Rc::new(RefCell::new(None));

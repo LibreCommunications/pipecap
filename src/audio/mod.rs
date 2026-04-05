@@ -36,6 +36,7 @@ pub struct AudioBuffer {
 pub enum AudioTarget {
     System,
     AppFromVideoNode(u32),
+    AppByName(String),
 }
 
 pub struct AudioCapturer {
@@ -61,6 +62,7 @@ impl AudioCapturer {
             let result = match target {
                 AudioTarget::System => system::run(buf, ch, sr, stop),
                 AudioTarget::AppFromVideoNode(id) => app::run(id, buf, ch, sr, stop),
+                AudioTarget::AppByName(name) => app::run_by_name(name, buf, ch, sr, stop),
             };
             if let Err(e) = result {
                 eprintln!("pipecap-audio: error: {e}");

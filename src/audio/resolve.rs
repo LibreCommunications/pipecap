@@ -1,6 +1,6 @@
-//! App identity resolution from PipeWire video node properties.
+//! App identity resolution and PipeWire graph queries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 pub enum SessionMatcher {
@@ -80,4 +80,54 @@ pub fn audio_node_matches(
             })
         }
     }
+}
+
+// ── Graph queries ──────────────────────────────────
+
+pub struct AudioApp {
+    pub name: String,
+    pub binary: String,
+}
+
+/// List audio-producing applications from the PipeWire graph.
+pub fn list_audio_apps() -> anyhow::Result<Vec<AudioApp>> {
+    let output = std::process::Command::new("pw-dump")
+        .output()
+        .map_err(|e| anyhow::anyhow!("pw-dump: {e}"))?;
+
+    let objects: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow::anyhow!("pw-dump parse: {e}"))?;
+
+    let mut seen = HashSet::new();
+    let mut apps = Vec::new();
+
+    for obj in &objects {
+        if obj.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let Some(props) = obj.pointer("/info/props") else { continue };
+        if props.get("media.class").and_then(|v| v.as_str()) != Some("Stream/Output/Audio") {
+            continue;
+        }
+        let name = props.get("application.name").and_then(|v| v.as_str()).unwrap_or("");
+        let binary = props.get("application.process.binary").and_then(|v| v.as_str()).unwrap_or("");
+        if name.is_empty() { continue; }
+        if seen.insert(name.to_string()) {
+            apps.push(AudioApp { name: name.to_string(), binary: binary.to_string() });
+        }
+    }
+    apps.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(apps)
+}
+
+/// Resolve the captured app's name from the portal video node.
+/// Returns None if the app cannot be identified.
+pub fn resolve_app_name(video_node_id: u32) -> Option<String> {
+    let props = get_node_full_props(video_node_id);
+    let media_name = props.get("media.name").map(|s| s.as_str()).unwrap_or("");
+    eprintln!("pipecap-audio: video node {video_node_id} media.name={media_name:?}");
+
+    media_name.strip_prefix("kwin-screencast-")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
