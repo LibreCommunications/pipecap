@@ -39,9 +39,8 @@ impl ShmBuffer {
         let total_size = header_size + max_frame_size * 2;
 
         // Remove any stale shm
-        unsafe { libc::shm_unlink(SHM_NAME.as_ptr() as *const _); }
-
         let name = std::ffi::CString::new(SHM_NAME)?;
+        unsafe { libc::shm_unlink(name.as_ptr()); }
         let fd = unsafe {
             libc::shm_open(
                 name.as_ptr(),
@@ -83,14 +82,6 @@ impl ShmBuffer {
             size: total_size,
             fd,
         })
-    }
-
-    pub fn fd(&self) -> i32 {
-        self.fd
-    }
-
-    pub fn ptr(&self) -> *mut u8 {
-        self.ptr
     }
 
     pub fn size(&self) -> usize {

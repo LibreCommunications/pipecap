@@ -10,23 +10,61 @@ use std::sync::Mutex;
 static CAPTURER: Mutex<Option<capture::Capturer>> = Mutex::new(None);
 static AUDIO_CAPTURER: Mutex<Option<audio::AudioCapturer>> = Mutex::new(None);
 
+// ── Types ───────────────────────────────────────────
+
 /// Stream info returned by the portal picker.
 #[napi(object)]
 pub struct PortalStream {
     pub node_id: u32,
+    /// 1=monitor, 2=window
     pub source_type: u32,
     pub width: i32,
     pub height: i32,
 }
 
-/// Result from the portal picker — streams + PipeWire remote fd.
+/// Result from the portal picker.
 #[napi(object)]
 pub struct PickerResult {
     pub streams: Vec<PortalStream>,
+    /// PipeWire remote fd — pass to startCapture.
     pub pipewire_fd: i32,
 }
 
-/// Audio samples (interleaved f32 PCM).
+/// Capture options.
+#[napi(object)]
+pub struct CaptureOptions {
+    /// PipeWire node ID from showPicker().
+    pub node_id: u32,
+    /// PipeWire remote fd from showPicker().
+    pub pipewire_fd: i32,
+    /// Requested frame rate (0 = source native rate).
+    pub fps: u32,
+    /// Enable audio capture.
+    pub audio: bool,
+    /// For per-app audio: the application name to capture (from listAudioApps).
+    /// If unset or empty, captures all system audio.
+    pub app_name: Option<String>,
+}
+
+/// Shared memory info returned by startCapture.
+#[napi(object)]
+pub struct ShmInfo {
+    /// Path to the shared memory file.
+    pub shm_path: String,
+    /// Total size of the shared memory region in bytes.
+    pub shm_size: u32,
+    /// Size of the header at the start of the region.
+    pub header_size: u32,
+}
+
+/// An audio-producing application detected in PipeWire.
+#[napi(object)]
+pub struct AudioApp {
+    /// Display name of the application.
+    pub name: String,
+}
+
+/// Audio samples (interleaved f32 PCM as little-endian bytes).
 #[napi(object)]
 pub struct AudioChunk {
     pub channels: u32,
@@ -34,26 +72,11 @@ pub struct AudioChunk {
     pub data: napi::bindgen_prelude::Buffer,
 }
 
-/// Shared memory info returned by startCapture.
-#[napi(object)]
-pub struct ShmInfo {
-    pub shm_path: String,
-    pub shm_size: u32,
-    pub header_size: u32,
-}
-
-/// Capture options.
-#[napi(object)]
-pub struct CaptureOptions {
-    pub node_id: u32,
-    pub pipewire_fd: i32,
-    pub fps: u32,
-    pub audio: bool,
-    pub exclude_pid: Option<u32>,
-}
-
 // ── Portal ──────────────────────────────────────────
 
+/// Show the native xdg-desktop-portal screen/window picker.
+/// `sourceTypes`: 1=monitors, 2=windows, 3=both.
+/// Returns the selected stream(s), or null if the user cancelled.
 #[napi]
 pub async fn show_picker(source_types: u32) -> Result<Option<PickerResult>> {
     let result = portal::request_screen_cast(source_types)
@@ -77,20 +100,58 @@ pub async fn show_picker(source_types: u32) -> Result<Option<PickerResult>> {
     }
 }
 
+// ── Audio Apps ───────────────────────────────────────
+
+/// List applications currently producing audio.
+/// Returns unique app names — show these in a dropdown for per-app audio selection.
+#[napi]
+pub fn list_audio_apps() -> Result<Vec<AudioApp>> {
+    let output = std::process::Command::new("pw-dump")
+        .output()
+        .map_err(|e| Error::new(Status::GenericFailure, format!("pw-dump: {e}")))?;
+
+    let objects: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("pw-dump parse: {e}")))?;
+
+    let mut apps = std::collections::HashSet::new();
+    for obj in &objects {
+        if obj.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let props = match obj.pointer("/info/props") {
+            Some(p) => p,
+            None => continue,
+        };
+        if props.get("media.class").and_then(|v| v.as_str()) != Some("Stream/Output/Audio") {
+            continue;
+        }
+        if let Some(name) = props.get("application.name").and_then(|v| v.as_str()) {
+            if !name.is_empty() {
+                apps.insert(name.to_string());
+            }
+        }
+    }
+
+    let mut result: Vec<AudioApp> = apps.into_iter().map(|name| AudioApp { name }).collect();
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(result)
+}
+
 // ── Capture ─────────────────────────────────────────
 
-/// Start capturing. Returns a Buffer backed by the shared memory region.
-/// The renderer can read frames directly from this buffer — zero copy.
+/// Start video + optional audio capture.
 ///
-/// Layout: ShmHeader (32 bytes) + slot0 + slot1
-/// ShmHeader: { seq: u64, width: u32, height: u32, stride: u32, data_offset: u32, data_size: u32 }
-/// Poll seq to detect new frames, read pixels from data_offset..data_offset+data_size.
-/// Start capturing. Returns a handle object with shm info.
-/// Call `getShmBuffer()` to get a zero-copy view into the shared memory.
+/// Video frames are written to shared memory at `/dev/shm/pipecap-frames`.
+/// Read the 32-byte header to detect new frames, then read pixel data.
+///
+/// Audio mode depends on `appName`:
+/// - `undefined` or `""` → capture all system audio (sink monitor)
+/// - `"Firefox"` etc → capture only that app's audio (PipeWire link-based)
+///
+/// Returns shared memory info for the renderer.
 #[napi]
 pub fn start_capture(options: CaptureOptions) -> Result<ShmInfo> {
     // Video
-    let shm_ptr;
     let shm_size;
     {
         let mut lock = CAPTURER
@@ -98,20 +159,23 @@ pub fn start_capture(options: CaptureOptions) -> Result<ShmInfo> {
             .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
         lock.take();
         let capturer = capture::Capturer::new(options.node_id, options.pipewire_fd, options.fps)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("capture error: {e}")))?;
-        shm_ptr = capturer.shm_ptr();
+            .map_err(|e| Error::new(Status::GenericFailure, format!("capture: {e}")))?;
         shm_size = capturer.shm_size();
         *lock = Some(capturer);
     }
 
-    // Audio (optional)
+    // Audio
     if options.audio {
         let mut lock = AUDIO_CAPTURER
             .lock()
             .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
         lock.take();
-        let capturer = audio::AudioCapturer::new(options.exclude_pid.unwrap_or(0))
-            .map_err(|e| Error::new(Status::GenericFailure, format!("audio capture error: {e}")))?;
+
+        let app_name = options.app_name
+            .filter(|s| !s.is_empty());
+
+        let capturer = audio::AudioCapturer::new(app_name)
+            .map_err(|e| Error::new(Status::GenericFailure, format!("audio: {e}")))?;
         *lock = Some(capturer);
     }
 
@@ -122,7 +186,8 @@ pub fn start_capture(options: CaptureOptions) -> Result<ShmInfo> {
     })
 }
 
-/// Read accumulated audio samples. Returns null if not available.
+/// Read accumulated audio samples. Returns null if no audio available.
+/// Audio is interleaved f32 PCM (typically stereo 48kHz). Buffer is drained on each call.
 #[napi]
 pub fn read_audio() -> Result<Option<AudioChunk>> {
     let lock = AUDIO_CAPTURER
@@ -141,60 +206,6 @@ pub fn read_audio() -> Result<Option<AudioChunk>> {
                 }))
             }
         },
-    }
-}
-
-/// Read the current frame header from shared memory. Returns [seq, width, height, dataOffset, dataSize].
-/// The renderer uses this to know where to read pixels from the mmap'd buffer.
-/// Returns null if not capturing or no frame available.
-#[napi]
-pub fn read_frame_info() -> Result<Option<Vec<u32>>> {
-    let lock = CAPTURER
-        .lock()
-        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
-    match lock.as_ref() {
-        None => Ok(None),
-        Some(cap) => {
-            let ptr = cap.shm_ptr();
-            if ptr.is_null() { return Ok(None); }
-
-            // Read header atomically
-            let header = unsafe { &*(ptr as *const shm::ShmHeader) };
-            let seq = header.seq.load(std::sync::atomic::Ordering::Acquire);
-            if seq == 0 { return Ok(None); }
-
-            let width = header.width.load(std::sync::atomic::Ordering::Relaxed);
-            let height = header.height.load(std::sync::atomic::Ordering::Relaxed);
-            let data_offset = header.data_offset.load(std::sync::atomic::Ordering::Relaxed);
-            let data_size = header.data_size.load(std::sync::atomic::Ordering::Relaxed);
-
-            Ok(Some(vec![seq as u32, width, height, data_offset, data_size]))
-        }
-    }
-}
-
-/// Read frame pixels from shared memory. Zero-copy — returns a Buffer view into mmap'd memory.
-/// `offset` and `size` come from readFrameInfo().
-#[napi]
-pub fn read_frame_pixels(offset: u32, size: u32) -> Result<napi::bindgen_prelude::Buffer> {
-    let lock = CAPTURER
-        .lock()
-        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
-    match lock.as_ref() {
-        None => Err(Error::new(Status::GenericFailure, "not capturing")),
-        Some(cap) => {
-            let ptr = cap.shm_ptr();
-            let shm_size = cap.shm_size();
-            let end = offset as usize + size as usize;
-            if end > shm_size {
-                return Err(Error::new(Status::GenericFailure, "offset+size exceeds shm"));
-            }
-            // Copy from mmap — single memcpy, no allocation overhead
-            let slice = unsafe {
-                std::slice::from_raw_parts(ptr.add(offset as usize), size as usize)
-            };
-            Ok(slice.to_vec().into())
-        }
     }
 }
 

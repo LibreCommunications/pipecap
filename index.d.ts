@@ -6,60 +6,82 @@
 /** Stream info returned by the portal picker. */
 export interface PortalStream {
   nodeId: number
+  /** 1=monitor, 2=window */
   sourceType: number
   width: number
   height: number
 }
-/** Result from the portal picker — streams + PipeWire remote fd. */
+/** Result from the portal picker. */
 export interface PickerResult {
   streams: Array<PortalStream>
+  /** PipeWire remote fd — pass to startCapture. */
   pipewireFd: number
 }
-/** Audio samples (interleaved f32 PCM). */
+/** Capture options. */
+export interface CaptureOptions {
+  /** PipeWire node ID from showPicker(). */
+  nodeId: number
+  /** PipeWire remote fd from showPicker(). */
+  pipewireFd: number
+  /** Requested frame rate (0 = source native rate). */
+  fps: number
+  /** Enable audio capture. */
+  audio: boolean
+  /**
+   * For per-app audio: the application name to capture (from listAudioApps).
+   * If unset or empty, captures all system audio.
+   */
+  appName?: string
+}
+/** Shared memory info returned by startCapture. */
+export interface ShmInfo {
+  /** Path to the shared memory file. */
+  shmPath: string
+  /** Total size of the shared memory region in bytes. */
+  shmSize: number
+  /** Size of the header at the start of the region. */
+  headerSize: number
+}
+/** An audio-producing application detected in PipeWire. */
+export interface AudioApp {
+  /** Display name of the application. */
+  name: string
+}
+/** Audio samples (interleaved f32 PCM as little-endian bytes). */
 export interface AudioChunk {
   channels: number
   sampleRate: number
   data: Buffer
 }
-/** Shared memory info returned by startCapture. */
-export interface ShmInfo {
-  shmPath: string
-  shmSize: number
-  headerSize: number
-}
-/** Capture options. */
-export interface CaptureOptions {
-  nodeId: number
-  pipewireFd: number
-  fps: number
-  audio: boolean
-  excludePid?: number
-}
+/**
+ * Show the native xdg-desktop-portal screen/window picker.
+ * `sourceTypes`: 1=monitors, 2=windows, 3=both.
+ * Returns the selected stream(s), or null if the user cancelled.
+ */
 export declare function showPicker(sourceTypes: number): Promise<PickerResult | null>
 /**
- * Start capturing. Returns a Buffer backed by the shared memory region.
- * The renderer can read frames directly from this buffer — zero copy.
+ * List applications currently producing audio.
+ * Returns unique app names — show these in a dropdown for per-app audio selection.
+ */
+export declare function listAudioApps(): Array<AudioApp>
+/**
+ * Start video + optional audio capture.
  *
- * Layout: ShmHeader (32 bytes) + slot0 + slot1
- * ShmHeader: { seq: u64, width: u32, height: u32, stride: u32, data_offset: u32, data_size: u32 }
- * Poll seq to detect new frames, read pixels from data_offset..data_offset+data_size.
- * Start capturing. Returns a handle object with shm info.
- * Call `getShmBuffer()` to get a zero-copy view into the shared memory.
+ * Video frames are written to shared memory at `/dev/shm/pipecap-frames`.
+ * Read the 32-byte header to detect new frames, then read pixel data.
+ *
+ * Audio mode depends on `appName`:
+ * - `undefined` or `""` → capture all system audio (sink monitor)
+ * - `"Firefox"` etc → capture only that app's audio (PipeWire link-based)
+ *
+ * Returns shared memory info for the renderer.
  */
 export declare function startCapture(options: CaptureOptions): ShmInfo
-/** Read accumulated audio samples. Returns null if not available. */
+/**
+ * Read accumulated audio samples. Returns null if no audio available.
+ * Audio is interleaved f32 PCM (typically stereo 48kHz). Buffer is drained on each call.
+ */
 export declare function readAudio(): AudioChunk | null
-/**
- * Read the current frame header from shared memory. Returns [seq, width, height, dataOffset, dataSize].
- * The renderer uses this to know where to read pixels from the mmap'd buffer.
- * Returns null if not capturing or no frame available.
- */
-export declare function readFrameInfo(): Array<number> | null
-/**
- * Read frame pixels from shared memory. Zero-copy — returns a Buffer view into mmap'd memory.
- * `offset` and `size` come from readFrameInfo().
- */
-export declare function readFramePixels(offset: number, size: number): Buffer
 /** Check if capture is currently active. */
 export declare function isCapturing(): boolean
 /** Stop all capture (video + audio) and release resources. */

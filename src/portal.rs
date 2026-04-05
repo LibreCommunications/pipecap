@@ -1,12 +1,11 @@
 //! xdg-desktop-portal ScreenCast client via ashpd.
-//! Shows the native Wayland screen/window picker and returns PipeWire stream info
-//! along with the PipeWire remote fd for connecting to the portal's stream.
+//! Shows the native Wayland screen/window picker and returns PipeWire stream info.
 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::PersistMode;
+use ashpd::enumflags2::BitFlags;
 use std::os::fd::{OwnedFd, IntoRawFd};
 
-/// Result from the portal's Start method.
 pub struct StreamInfo {
     pub node_id: u32,
     pub source_type: u32,
@@ -16,17 +15,22 @@ pub struct StreamInfo {
 
 pub struct PortalResult {
     pub streams: Vec<StreamInfo>,
-    /// Raw fd to the PipeWire remote — pass to pw_context_connect_fd
     pub pipewire_fd: i32,
 }
 
 /// Show the native screen picker via xdg-desktop-portal.
 /// Returns the streams + PipeWire remote fd, or None if cancelled.
-pub async fn request_screen_cast(_source_types: u32) -> anyhow::Result<Option<PortalResult>> {
+pub async fn request_screen_cast(source_types: u32) -> anyhow::Result<Option<PortalResult>> {
     let proxy = Screencast::new().await?;
     let session = proxy.create_session().await?;
 
-    let st = SourceType::Monitor | SourceType::Window;
+    let st: BitFlags<SourceType> = if source_types == 1 {
+        SourceType::Monitor.into()
+    } else if source_types == 2 {
+        SourceType::Window.into()
+    } else {
+        SourceType::Monitor | SourceType::Window
+    };
 
     proxy
         .select_sources(
@@ -49,7 +53,6 @@ pub async fn request_screen_cast(_source_types: u32) -> anyhow::Result<Option<Po
         return Ok(None);
     }
 
-    // Get the PipeWire remote fd — this is how we connect to the portal's stream
     let pw_fd: OwnedFd = proxy.open_pipe_wire_remote(&session).await?;
     let raw_fd = pw_fd.into_raw_fd();
 

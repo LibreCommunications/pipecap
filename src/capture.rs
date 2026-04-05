@@ -38,16 +38,8 @@ impl Capturer {
         Ok(Capturer { shm, stop_flag, thread: Some(thread) })
     }
 
-    pub fn shm_ptr(&self) -> *mut u8 {
-        self.shm.ptr()
-    }
-
     pub fn shm_size(&self) -> usize {
         self.shm.size()
-    }
-
-    pub fn is_active(&self) -> bool {
-        !self.stop_flag.load(Ordering::Relaxed)
     }
 }
 
@@ -69,18 +61,18 @@ fn run_capture_loop(
 ) -> anyhow::Result<()> {
     pw::init();
 
-    let mainloop = pw::main_loop::MainLoopBox::new(None)?;
-    let context = pw::context::ContextBox::new(mainloop.loop_(), None)?;
+    let mainloop = pw::main_loop::MainLoopRc::new(None)?;
+    let context = pw::context::ContextRc::new(&mainloop, None)?;
 
     let fd = unsafe { OwnedFd::from_raw_fd(pipewire_fd) };
-    let core = context.connect_fd(fd, None)?;
+    let core = context.connect_fd_rc(fd, None)?;
     eprintln!("pipecap: connected to PipeWire remote via fd {pipewire_fd}");
 
     let mut props = pw::properties::PropertiesBox::new();
     props.insert(*pw::keys::MEDIA_TYPE, "Video");
     props.insert(*pw::keys::MEDIA_CATEGORY, "Capture");
     props.insert(*pw::keys::MEDIA_ROLE, "Screen");
-    let stream = pw::stream::StreamBox::new(&core, "pipecap-video", props)?;
+    let stream = pw::stream::StreamRc::new(core, "pipecap-video", props)?;
 
     let obj = spa::pod::object!(
         spa::utils::SpaTypes::ObjectParamFormat,
@@ -173,7 +165,6 @@ fn run_capture_loop(
 
                             if let Some(slice) = data.data() {
                                 if offset + size <= slice.len() && w > 0 && h > 0 {
-                                    // Write directly to shared memory — no Vec allocation
                                     shm.write_frame(w, h, stride as u32, &slice[offset..offset + size]);
                                 }
                             }
@@ -197,13 +188,15 @@ fn run_capture_loop(
 
     eprintln!("pipecap: stream connected to node {node_id}");
 
-    let mainloop_ptr = mainloop.as_raw_ptr();
-    let timer = mainloop.loop_().add_timer(move |_| {
+    let mainloop_weak = mainloop.downgrade();
+    let _timer = mainloop.loop_().add_timer(move |_| {
         if stop_flag.load(Ordering::Relaxed) {
-            unsafe { pipewire_sys::pw_main_loop_quit(mainloop_ptr) };
+            if let Some(ml) = mainloop_weak.upgrade() {
+                ml.quit();
+            }
         }
     });
-    timer.update_timer(
+    _timer.update_timer(
         Some(std::time::Duration::from_millis(100)),
         Some(std::time::Duration::from_millis(100)),
     );

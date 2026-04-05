@@ -10,7 +10,7 @@
  */
 
 let pipecap = null;
-let frameInterval = null;
+let audioInterval = null;
 
 function loadPipecap() {
   if (pipecap) return pipecap;
@@ -45,35 +45,28 @@ function setupPipecap(ipcMain, getWindow) {
     if (!pc) return false;
 
     // Stop any existing capture
-    if (frameInterval) {
-      clearInterval(frameInterval);
-      frameInterval = null;
+    if (audioInterval) {
+      clearInterval(audioInterval);
+      audioInterval = null;
     }
     try { pc.stopCapture(); } catch { /* ignore */ }
 
-    pc.startCapture(options);
+    const shmInfo = pc.startCapture(options);
 
-    // Pump frames to renderer at the requested fps
-    const fps = options.fps || 30;
-    const win = getWindow();
-    if (win && !win.isDestroyed()) {
-      frameInterval = setInterval(() => {
-        const w = getWindow();
-        if (!w || w.isDestroyed()) {
-          clearInterval(frameInterval);
-          frameInterval = null;
-          return;
-        }
-        try {
-          const frame = pc.readFrame();
-          if (frame) {
-            w.webContents.send('pipecap:frame', {
-              width: frame.width,
-              height: frame.height,
-              data: frame.data,
-            });
+    // Video frames are delivered via shared memory (shmInfo.shmPath),
+    // not IPC — the renderer reads them directly.
+    // Audio chunks are pumped to the renderer via IPC.
+    if (options.audio) {
+      const win = getWindow();
+      if (win && !win.isDestroyed()) {
+        audioInterval = setInterval(() => {
+          const w = getWindow();
+          if (!w || w.isDestroyed()) {
+            clearInterval(audioInterval);
+            audioInterval = null;
+            return;
           }
-          if (options.audio) {
+          try {
             const audio = pc.readAudio();
             if (audio) {
               w.webContents.send('pipecap:audio', {
@@ -82,20 +75,20 @@ function setupPipecap(ipcMain, getWindow) {
                 data: audio.data,
               });
             }
+          } catch {
+            // Capture may have stopped
           }
-        } catch {
-          // Capture may have stopped
-        }
-      }, Math.round(1000 / fps));
+        }, 20); // ~50Hz polling for audio chunks
+      }
     }
 
-    return true;
+    return shmInfo;
   });
 
   ipcMain.handle('pipecap:stopCapture', () => {
-    if (frameInterval) {
-      clearInterval(frameInterval);
-      frameInterval = null;
+    if (audioInterval) {
+      clearInterval(audioInterval);
+      audioInterval = null;
     }
     const pc = loadPipecap();
     if (pc) {
