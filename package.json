@@ -1,7 +1,7 @@
 {
   "name": "@librecord/pipecap",
-  "version": "0.1.0",
-  "description": "Native PipeWire screen capture for Electron — xdg-desktop-portal picker + video frames",
+  "version": "0.1.1",
+  "description": "Native PipeWire audio capture for Electron on Linux",
   "main": "index.js",
   "types": "index.d.ts",
   "license": "AGPL-3.0",
@@ -22,6 +22,7 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
+    "postinstall": "node scripts/download-prebuilt.js",
     "artifacts": "napi artifacts",
     "version": "napi version"
   },
@@ -31,6 +32,6 @@
   "files": [
     "index.js",
     "index.d.ts",
-    "electron/"
+    "scripts/"
   ]
 }
