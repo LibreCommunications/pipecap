@@ -146,13 +146,13 @@ fn get_node_full_props(node_id: u32) -> std::collections::HashMap<String, String
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        let trimmed = line.trim();
-        // pw-cli info output format: "  key = \"value\"" or "  key = value"
+        // pw-cli info format: "*\t\tkey = \"value\"" (with * prefix, tabs)
+        let trimmed = line.trim_start_matches(['*', '\t', ' ']);
         if let Some((key, val)) = trimmed.split_once(" = ") {
-            let key = key.trim().replace('*', "");
-            let val = val.trim().trim_matches('"').to_string();
+            let key = key.trim();
+            let val = val.trim().trim_matches('"');
             if !key.is_empty() && !val.is_empty() {
-                props.insert(key, val);
+                props.insert(key.to_string(), val.to_string());
             }
         }
     }
