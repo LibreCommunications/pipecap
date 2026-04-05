@@ -19,15 +19,17 @@ export interface CaptureOptions {
   pipewireFd: number
   fps: number
   audio: boolean
-  appName?: string
+  /**
+   * 1=monitor, 2=window. Determines audio mode:
+   * monitor → system audio (sink monitor),
+   * window → per-app audio (auto-detected from video node).
+   */
+  sourceType: number
 }
 export interface ShmInfo {
   shmPath: string
   shmSize: number
   headerSize: number
-}
-export interface AudioApp {
-  name: string
 }
 export interface AudioChunk {
   channels: number
@@ -39,8 +41,6 @@ export interface AudioChunk {
  * `sourceTypes`: 1=monitors, 2=windows, 3=both.
  */
 export declare function showPicker(sourceTypes: number): Promise<PickerResult | null>
-/** List applications currently producing audio (via `pw-dump`). */
-export declare function listAudioApps(): Array<AudioApp>
 /** Start video + optional audio capture. Returns shared memory info. */
 export declare function startCapture(options: CaptureOptions): ShmInfo
 /** Read accumulated audio samples (interleaved f32 PCM). Returns null if none available. */

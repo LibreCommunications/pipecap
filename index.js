@@ -310,10 +310,9 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { showPicker, listAudioApps, startCapture, readAudio, isCapturing, stopCapture } = nativeBinding
+const { showPicker, startCapture, readAudio, isCapturing, stopCapture } = nativeBinding
 
 module.exports.showPicker = showPicker
-module.exports.listAudioApps = listAudioApps
 module.exports.startCapture = startCapture
 module.exports.readAudio = readAudio
 module.exports.isCapturing = isCapturing

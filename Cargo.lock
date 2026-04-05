@@ -809,7 +809,6 @@ dependencies = [
  "napi-derive",
  "pipewire",
  "pipewire-sys",
- "serde_json",
  "tokio",
 ]
 

@@ -34,7 +34,10 @@ pub struct CaptureOptions {
     pub pipewire_fd: i32,
     pub fps: u32,
     pub audio: bool,
-    pub app_name: Option<String>,
+    /// 1=monitor, 2=window. Determines audio mode:
+    /// monitor → system audio (sink monitor),
+    /// window → per-app audio (auto-detected from video node).
+    pub source_type: u32,
 }
 
 #[napi(object)]
@@ -42,11 +45,6 @@ pub struct ShmInfo {
     pub shm_path: String,
     pub shm_size: u32,
     pub header_size: u32,
-}
-
-#[napi(object)]
-pub struct AudioApp {
-    pub name: String,
 }
 
 #[napi(object)]
@@ -78,39 +76,6 @@ pub async fn show_picker(source_types: u32) -> Result<Option<PickerResult>> {
     }))
 }
 
-// ── Audio apps ─────────────────────────────────────
-
-/// List applications currently producing audio (via `pw-dump`).
-#[napi]
-pub fn list_audio_apps() -> Result<Vec<AudioApp>> {
-    let output = std::process::Command::new("pw-dump")
-        .output()
-        .map_err(|e| Error::new(Status::GenericFailure, format!("pw-dump: {e}")))?;
-
-    let objects: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
-        .map_err(|e| Error::new(Status::GenericFailure, format!("pw-dump parse: {e}")))?;
-
-    let mut apps = std::collections::HashSet::new();
-    for obj in &objects {
-        if obj.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
-            continue;
-        }
-        let Some(props) = obj.pointer("/info/props") else { continue };
-        if props.get("media.class").and_then(|v| v.as_str()) != Some("Stream/Output/Audio") {
-            continue;
-        }
-        if let Some(name) = props.get("application.name").and_then(|v| v.as_str()) {
-            if !name.is_empty() {
-                apps.insert(name.to_string());
-            }
-        }
-    }
-
-    let mut result: Vec<AudioApp> = apps.into_iter().map(|name| AudioApp { name }).collect();
-    result.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(result)
-}
-
 // ── Capture ────────────────────────────────────────
 
 /// Start video + optional audio capture. Returns shared memory info.
@@ -131,8 +96,14 @@ pub fn start_capture(options: CaptureOptions) -> Result<ShmInfo> {
         let mut lock = AUDIO_CAPTURER.lock()
             .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
         lock.take();
-        let app_name = options.app_name.filter(|s| !s.is_empty());
-        let capturer = audio::AudioCapturer::new(app_name)
+        let target = if options.source_type == 2 {
+            // Window capture: per-app audio, resolve app from the video node
+            audio::AudioTarget::AppFromVideoNode(options.node_id)
+        } else {
+            // Monitor capture: all system audio
+            audio::AudioTarget::System
+        };
+        let capturer = audio::AudioCapturer::new(target)
             .map_err(|e| Error::new(Status::GenericFailure, format!("audio: {e}")))?;
         *lock = Some(capturer);
     }
