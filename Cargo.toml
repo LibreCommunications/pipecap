@@ -1,8 +1,8 @@
 [package]
 name = "pipecap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Native PipeWire screen capture for Electron — portal picker + video frames"
+description = "Native PipeWire audio capture for Electron — per-app or system audio"
 license = "AGPL-3.0"
 
 [lib]
@@ -10,20 +10,13 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Node.js native addon
-napi = { version = "2", features = ["async", "napi8"] }
+napi = { version = "2", features = ["napi8"] }
 napi-derive = "2"
 
-# PipeWire client (git for PipeWire 1.6 compat)
+# PipeWire client
 pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs.git" }
 pipewire-sys = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs.git" }
 libspa = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs.git" }
-
-# xdg-desktop-portal (ScreenCast)
-ashpd = { version = "0.10", features = ["tokio"] }
-tokio = { version = "1", features = ["rt", "sync", "time"] }
-
-# System
-libc = "0.2"
 
 # JSON parsing (pw-dump)
 serde_json = "1"

@@ -7,7 +7,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use super::{connect_stream_to, MAX_SAMPLES};
+use super::{audio_format_params, MAX_SAMPLES, STREAM_FLAGS};
 
 pub fn run(
     buffer: Arc<Mutex<Vec<f32>>>,
@@ -73,7 +73,9 @@ pub fn run(
         })
         .register()?;
 
-    connect_stream_to(&stream, None);
+    let bytes = audio_format_params();
+    let mut params = [spa::pod::Pod::from_bytes(&bytes).unwrap()];
+    stream.connect(spa::utils::Direction::Input, None, STREAM_FLAGS, &mut params)?;
     eprintln!("pipecap-audio: connected to sink monitor");
 
     let ml = mainloop.downgrade();

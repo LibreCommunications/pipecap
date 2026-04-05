@@ -1,8 +1,6 @@
 //! Per-app audio capture via PipeWire registry watching.
 //!
-//! Creates a fresh capture stream for each matched audio node rather than
-//! reusing one — PipeWire streams don't reliably produce audio after
-//! disconnect/reconnect to a different node.
+//! Creates a fresh capture stream for each matched audio node.
 
 use pipewire as pw;
 use pw::spa;
@@ -15,11 +13,9 @@ use std::sync::{
 };
 
 use super::MAX_SAMPLES;
-use super::resolve::{self, audio_node_matches};
+use super::resolve;
 use crate::pw_util;
 
-/// A live audio stream connected to a specific node.
-/// Dropping this disconnects and cleans up.
 struct LiveStream {
     _stream: pw::stream::StreamRc,
     _listener: pw::stream::StreamListener<spa::param::audio::AudioInfoRaw>,
@@ -62,17 +58,12 @@ fn create_stream(
 
             let size = data.chunk().size() as usize;
             if n < 3 { eprintln!("pipecap-audio: frame #{n} size={size}"); }
-
             let Some(samples) = data.data() else { return };
             if size == 0 || size > samples.len() { return; }
 
             let f32_slice: &[f32] = unsafe {
-                std::slice::from_raw_parts(
-                    samples.as_ptr() as *const f32,
-                    size / std::mem::size_of::<f32>(),
-                )
+                std::slice::from_raw_parts(samples.as_ptr() as *const f32, size / 4)
             };
-
             if let Ok(mut lock) = buf.lock() {
                 lock.extend_from_slice(f32_slice);
                 if lock.len() > MAX_SAMPLES {
@@ -83,51 +74,19 @@ fn create_stream(
         })
         .register()?;
 
-    // Connect to the target node
     let bytes = super::audio_format_params();
     let mut params = [spa::pod::Pod::from_bytes(&bytes).unwrap()];
     stream.connect(
-        spa::utils::Direction::Input,
-        Some(node_id),
-        super::STREAM_FLAGS,
-        &mut params,
+        spa::utils::Direction::Input, Some(node_id),
+        super::STREAM_FLAGS, &mut params,
     )?;
 
     eprintln!("pipecap-audio: stream connected to node {node_id}");
     Ok(LiveStream { _stream: stream, _listener: listener })
 }
 
-/// Per-app capture resolved from a portal video node.
-pub fn run(
-    video_node_id: u32,
-    buffer: Arc<Mutex<Vec<f32>>>,
-    channels_out: Arc<Mutex<u32>>,
-    sample_rate_out: Arc<Mutex<u32>>,
-    stop_flag: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
-    let matcher = resolve::resolve_session_matcher(video_node_id);
-    match &matcher {
-        Some(m) => eprintln!("pipecap-audio: matcher={:?}", m),
-        None => eprintln!("pipecap-audio: no matcher found, will watch all new audio nodes"),
-    }
-    run_with_matcher(matcher, buffer, channels_out, sample_rate_out, stop_flag)
-}
-
-/// Per-app capture by explicit app name (from setAudioTarget).
 pub fn run_by_name(
     app_name: String,
-    buffer: Arc<Mutex<Vec<f32>>>,
-    channels_out: Arc<Mutex<u32>>,
-    sample_rate_out: Arc<Mutex<u32>>,
-    stop_flag: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
-    let matcher = Some(resolve::SessionMatcher::AppName(app_name));
-    eprintln!("pipecap-audio: matcher={:?}", matcher.as_ref().unwrap());
-    run_with_matcher(matcher, buffer, channels_out, sample_rate_out, stop_flag)
-}
-
-fn run_with_matcher(
-    matcher: Option<resolve::SessionMatcher>,
     buffer: Arc<Mutex<Vec<f32>>>,
     channels_out: Arc<Mutex<u32>>,
     sample_rate_out: Arc<Mutex<u32>>,
@@ -139,9 +98,9 @@ fn run_with_matcher(
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
 
-    // Current live stream — replaced each time a new matching node appears
-    let live: Rc<RefCell<Option<LiveStream>>> = Rc::new(RefCell::new(None));
+    eprintln!("pipecap-audio: per-app mode (app={app_name})");
 
+    let live: Rc<RefCell<Option<LiveStream>>> = Rc::new(RefCell::new(None));
     let registry = core.get_registry().map_err(|e| anyhow::anyhow!("get_registry: {e}"))?;
 
     let live_g = live.clone();
@@ -150,10 +109,11 @@ fn run_with_matcher(
     let buf_g = buffer.clone();
     let ch_g = channels_out.clone();
     let sr_g = sample_rate_out.clone();
-    let connected_to: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
-    let connected_g = connected_to.clone();
-    let connected_r = connected_to.clone();
-    let matcher_for_remove = matcher.clone();
+    let connected: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+    let conn_g = connected.clone();
+    let conn_r = connected.clone();
+    let name_g = app_name.clone();
+    let name_r = app_name.clone();
 
     let _reg_listener = registry
         .add_listener_local()
@@ -161,37 +121,31 @@ fn run_with_matcher(
             let Some(props) = global.props else { return };
             if global.type_ != ObjectType::Node { return; }
             if props.get("media.class") != Some("Stream/Output/Audio") { return; }
+            if !resolve::app_name_matches(props, &name_g) { return; }
 
-            if let Some(ref m) = matcher {
-                if !audio_node_matches(props, m) { return; }
-            }
-
-            eprintln!("pipecap-audio: matched audio node id={} app={:?}",
+            eprintln!("pipecap-audio: matched node {} (app={:?})",
                 global.id, props.get("application.name"));
 
-            // Drop old stream, create fresh one for this node
             *live_g.borrow_mut() = None;
-
             match create_stream(&core_g, global.id, &buf_g, &ch_g, &sr_g) {
                 Ok(s) => {
                     *live_g.borrow_mut() = Some(s);
-                    *connected_g.borrow_mut() = Some(global.id);
+                    *conn_g.borrow_mut() = Some(global.id);
                 }
                 Err(e) => eprintln!("pipecap-audio: stream create error: {e}"),
             }
         })
         .global_remove(move |id| {
-            if connected_r.borrow().map_or(false, |c| c == id) {
-                eprintln!("pipecap-audio: audio node {id} removed ({:?}), waiting...",
-                    matcher_for_remove);
+            if conn_r.borrow().map_or(false, |c| c == id) {
+                eprintln!("pipecap-audio: node {id} removed (app={name_r}), waiting...");
                 *live_r.borrow_mut() = None;
-                *connected_r.borrow_mut() = None;
+                *conn_r.borrow_mut() = None;
             }
         })
         .register();
 
     pw_util::do_roundtrip(&mainloop, &core);
-    eprintln!("pipecap-audio: watching registry for audio nodes...");
+    eprintln!("pipecap-audio: watching for audio nodes...");
 
     let ml = mainloop.downgrade();
     let _timer = mainloop.loop_().add_timer(move |_| {
