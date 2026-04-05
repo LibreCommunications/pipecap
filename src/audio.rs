@@ -1,10 +1,12 @@
 //! PipeWire audio stream consumer.
-//! Captures system audio output as interleaved f32 PCM via PipeWire's
-//! sink monitor. Filters out the calling process to prevent feedback.
+//! Captures system audio output as interleaved f32 PCM.
+//! Based on pipewire-rs audio-capture.rs example.
 
 use pipewire as pw;
+use pw::spa;
+use spa::pod::Pod;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -23,7 +25,7 @@ pub struct AudioCapturer {
 }
 
 impl AudioCapturer {
-    pub fn new(exclude_pid: u32) -> anyhow::Result<Self> {
+    pub fn new(_exclude_pid: u32) -> anyhow::Result<Self> {
         let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
         let channels: Arc<Mutex<u32>> = Arc::new(Mutex::new(2));
         let sample_rate: Arc<Mutex<u32>> = Arc::new(Mutex::new(48000));
@@ -35,8 +37,8 @@ impl AudioCapturer {
         let stop_ref = stop_flag.clone();
 
         let thread = std::thread::spawn(move || {
-            if let Err(e) = run_audio_loop(exclude_pid, buf_ref, ch_ref, sr_ref, stop_ref) {
-                eprintln!("pipecap: audio capture error: {e}");
+            if let Err(e) = run_audio_loop(buf_ref, ch_ref, sr_ref, stop_ref) {
+                eprintln!("pipecap-audio: capture error: {e}");
             }
         });
 
@@ -79,10 +81,9 @@ impl Drop for AudioCapturer {
 }
 
 fn run_audio_loop(
-    exclude_pid: u32,
     buffer: Arc<Mutex<Vec<f32>>>,
-    _channels: Arc<Mutex<u32>>,
-    _sample_rate: Arc<Mutex<u32>>,
+    channels_out: Arc<Mutex<u32>>,
+    sample_rate_out: Arc<Mutex<u32>>,
     stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     pw::init();
@@ -90,46 +91,67 @@ fn run_audio_loop(
     let mainloop = pw::main_loop::MainLoopBox::new(None)?;
     let context = pw::context::ContextBox::new(mainloop.loop_(), None)?;
     let core = context.connect(None)?;
+    eprintln!("pipecap-audio: connected to PipeWire");
 
+    // Capture from the default audio sink's monitor ports (system audio output)
     let mut props = pw::properties::PropertiesBox::new();
     props.insert(*pw::keys::MEDIA_TYPE, "Audio");
     props.insert(*pw::keys::MEDIA_CATEGORY, "Capture");
-    props.insert(*pw::keys::MEDIA_ROLE, "Screen");
-    props.insert("stream.capture.sink", "true");
-    // Exclude our own process audio to prevent feedback loop
-    if exclude_pid > 0 {
-        props.insert("stream.dont-remix", "true");
-        props.insert(
-            "node.exclude-from-capture.pids",
-            &*exclude_pid.to_string(),
-        );
-    }
+    props.insert(*pw::keys::MEDIA_ROLE, "Music");
+    props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
+
     let stream = pw::stream::StreamBox::new(&core, "pipecap-audio", props)?;
 
     let buf_ref = buffer;
+    let ch_out = channels_out;
+    let sr_out = sample_rate_out;
+    let audio_count = Arc::new(AtomicU64::new(0));
+    let ac = audio_count.clone();
 
     let _listener = stream
-        .add_local_listener_with_user_data(())
+        .add_local_listener_with_user_data(spa::param::audio::AudioInfoRaw::default())
+        .param_changed(move |_, user_data, id, param| {
+            let Some(param) = param else { return };
+            if id != spa::param::ParamType::Format.as_raw() { return; }
+
+            if let Ok((mt, ms)) = spa::param::format_utils::parse_format(param) {
+                if mt != spa::param::format::MediaType::Audio
+                    || ms != spa::param::format::MediaSubtype::Raw
+                {
+                    return;
+                }
+            }
+
+            if user_data.parse(param).is_ok() {
+                let ch = user_data.channels();
+                let rate = user_data.rate();
+                eprintln!("pipecap-audio: negotiated {ch}ch {rate}Hz");
+                if let Ok(mut c) = ch_out.lock() { *c = ch; }
+                if let Ok(mut r) = sr_out.lock() { *r = rate; }
+            }
+        })
         .process(move |stream_ref, _user_data| {
+            let n = ac.fetch_add(1, Ordering::Relaxed);
             if let Some(mut buffer) = stream_ref.dequeue_buffer() {
                 let datas = buffer.datas_mut();
                 if let Some(data) = datas.first_mut() {
                     let chunk = data.chunk();
                     let size = chunk.size() as usize;
-                    let offset = chunk.offset() as usize;
 
-                    if let Some(slice) = data.data() {
-                        if size > 0 && offset + size <= slice.len() {
-                            let audio_bytes = &slice[offset..offset + size];
-                            let samples: &[f32] = unsafe {
+                    if n < 3 {
+                        eprintln!("pipecap-audio: frame #{n} size={size}");
+                    }
+
+                    if let Some(samples) = data.data() {
+                        if size > 0 && size <= samples.len() {
+                            let f32_slice: &[f32] = unsafe {
                                 std::slice::from_raw_parts(
-                                    audio_bytes.as_ptr() as *const f32,
-                                    audio_bytes.len() / std::mem::size_of::<f32>(),
+                                    samples.as_ptr() as *const f32,
+                                    size / std::mem::size_of::<f32>(),
                                 )
                             };
                             if let Ok(mut lock) = buf_ref.lock() {
-                                lock.extend_from_slice(samples);
-                                // Cap at ~2 seconds of stereo 48kHz
+                                lock.extend_from_slice(f32_slice);
                                 const MAX_SAMPLES: usize = 48000 * 2 * 2;
                                 if lock.len() > MAX_SAMPLES {
                                     let drain = lock.len() - MAX_SAMPLES;
@@ -143,12 +165,34 @@ fn run_audio_loop(
         })
         .register()?;
 
+    // Build audio format params — request F32LE like the official example
+    let mut audio_info = spa::param::audio::AudioInfoRaw::new();
+    audio_info.set_format(spa::param::audio::AudioFormat::F32LE);
+    let obj = spa::pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: spa::param::ParamType::EnumFormat.as_raw(),
+        properties: audio_info.into(),
+    };
+    let values: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &spa::pod::Value::Object(obj),
+    )
+    .unwrap()
+    .0
+    .into_inner();
+
+    let mut params = [Pod::from_bytes(&values).unwrap()];
+
     stream.connect(
-        libspa::utils::Direction::Input,
+        spa::utils::Direction::Input,
         None,
-        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-        &mut [],
+        pw::stream::StreamFlags::AUTOCONNECT
+            | pw::stream::StreamFlags::MAP_BUFFERS
+            | pw::stream::StreamFlags::RT_PROCESS,
+        &mut params,
     )?;
+
+    eprintln!("pipecap-audio: stream connected");
 
     let mainloop_ptr = mainloop.as_raw_ptr();
     let timer = mainloop.loop_().add_timer(move |_| {
