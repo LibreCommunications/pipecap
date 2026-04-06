@@ -1,8 +1,9 @@
 //! PipeWire audio capture.
 //!
-//! Two modes:
+//! Three strategies:
 //!   - `system`: sink monitor (all desktop audio)
-//!   - `app`: per-app via registry watching by app name
+//!   - `app`: per-app via registry watching + session matcher
+//!   - (future) fallback when app can't be identified
 
 pub mod app;
 pub mod resolve;
@@ -10,6 +11,7 @@ pub mod system;
 
 use pipewire as pw;
 use pw::spa;
+use spa::pod::Pod;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -33,6 +35,7 @@ pub struct AudioBuffer {
 
 pub enum AudioTarget {
     System,
+    AppFromVideoNode(u32),
     AppByName(String),
 }
 
@@ -58,6 +61,7 @@ impl AudioCapturer {
         let thread = std::thread::spawn(move || {
             let result = match target {
                 AudioTarget::System => system::run(buf, ch, sr, stop),
+                AudioTarget::AppFromVideoNode(id) => app::run(id, buf, ch, sr, stop),
                 AudioTarget::AppByName(name) => app::run_by_name(name, buf, ch, sr, stop),
             };
             if let Err(e) = result {
@@ -87,7 +91,7 @@ impl Drop for AudioCapturer {
     }
 }
 
-// ── Shared helpers ─────────────────────────────────
+// ── Shared helpers used by system.rs and app.rs ────
 
 pub fn audio_format_params() -> Vec<u8> {
     let mut info = spa::param::audio::AudioInfoRaw::new();
@@ -97,4 +101,13 @@ pub fn audio_format_params() -> Vec<u8> {
         id: spa::param::ParamType::EnumFormat.as_raw(),
         properties: info.into(),
     })
+}
+
+pub fn connect_stream_to(stream: &pw::stream::StreamRc, node_id: Option<u32>) {
+    let _ = stream.disconnect();
+    let values = audio_format_params();
+    let mut params = [Pod::from_bytes(&values).unwrap()];
+    if let Err(e) = stream.connect(spa::utils::Direction::Input, node_id, STREAM_FLAGS, &mut params) {
+        eprintln!("pipecap-audio: connect error: {e}");
+    }
 }
