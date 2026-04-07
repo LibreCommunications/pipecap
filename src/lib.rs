@@ -72,13 +72,11 @@ pub struct AudioAppInfo {
 
 #[napi]
 pub async fn show_picker(source_types: u32) -> Result<Option<PickerResult>> {
-    let Some(r) = portal::request_screen_cast(source_types)
+    let result = portal::request_screen_cast(source_types)
         .await
-        .map_err(|e| err(format!("portal: {e}")))?
-    else {
-        return Ok(None);
-    };
+        .map_err(|e| err(format!("portal: {e}")))?;
 
+    let Some(r) = result else { return Ok(None) };
     Ok(Some(PickerResult {
         streams: r.streams.into_iter().map(|s| PortalStream {
             node_id: s.node_id,
