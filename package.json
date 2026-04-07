@@ -1,6 +1,6 @@
 {
   "name": "@librecord/pipecap",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Native PipeWire screen capture for Electron — xdg-desktop-portal picker + video frames",
   "main": "index.js",
   "types": "index.d.ts",
