@@ -5,36 +5,44 @@
 use pipewire as pw;
 use pw::spa;
 use spa::pod::Pod;
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc,
-};
+use std::os::fd::OwnedFd;
+use std::sync::{atomic::AtomicU64, Arc};
 
 use crate::pw_util;
 use crate::shm::ShmBuffer;
 
+/// Message sent from the controller thread to the PipeWire mainloop thread.
+enum CaptureMsg {
+    Stop,
+}
+
 pub struct Capturer {
     shm: Arc<ShmBuffer>,
-    stop_flag: Arc<AtomicBool>,
+    sender: pw::channel::Sender<CaptureMsg>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Capturer {
-    pub fn new(node_id: u32, pipewire_fd: i32, fps: u32) -> anyhow::Result<Self> {
+    pub fn new(node_id: u32, pipewire_fd: OwnedFd, fps: u32) -> anyhow::Result<Self> {
         let max_frame = 7680 * 4320 * 4; // 8K @ 4bpp
         let shm = Arc::new(ShmBuffer::new(max_frame)?);
-        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let (sender, receiver) = pw::channel::channel::<CaptureMsg>();
 
         let shm_ref = shm.clone();
-        let stop_ref = stop_flag.clone();
-        let thread = std::thread::spawn(move || {
-            if let Err(e) = run_capture_loop(node_id, pipewire_fd, fps, shm_ref, stop_ref) {
-                eprintln!("pipecap: capture loop error: {e}");
-            }
-        });
+        let thread = std::thread::Builder::new()
+            .name("pipecap-video".into())
+            .spawn(move || {
+                if let Err(e) = run_capture_loop(node_id, pipewire_fd, fps, shm_ref, receiver) {
+                    eprintln!("pipecap: capture loop error: {e}");
+                }
+            })?;
 
-        Ok(Capturer { shm, stop_flag, thread: Some(thread) })
+        Ok(Capturer {
+            shm,
+            sender,
+            thread: Some(thread),
+        })
     }
 
     pub fn shm_size(&self) -> usize {
@@ -44,7 +52,7 @@ impl Capturer {
 
 impl Drop for Capturer {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
+        let _ = self.sender.send(CaptureMsg::Stop);
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -94,18 +102,17 @@ fn video_format_params(fps: u32) -> Vec<u8> {
 
 fn run_capture_loop(
     node_id: u32,
-    pipewire_fd: i32,
+    pipewire_fd: OwnedFd,
     fps: u32,
     shm: Arc<ShmBuffer>,
-    stop_flag: Arc<AtomicBool>,
+    receiver: pw::channel::Receiver<CaptureMsg>,
 ) -> anyhow::Result<()> {
     pw::init();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
-    let fd = unsafe { OwnedFd::from_raw_fd(pipewire_fd) };
-    let core = context.connect_fd_rc(fd, None)?;
-    eprintln!("pipecap: connected to PipeWire remote via fd {pipewire_fd}");
+    let core = context.connect_fd_rc(pipewire_fd, None)?;
+    eprintln!("pipecap: connected to PipeWire remote");
 
     let mut props = pw::properties::PropertiesBox::new();
     props.insert(*pw::keys::MEDIA_TYPE, "Video");
@@ -114,37 +121,61 @@ fn run_capture_loop(
 
     let stream = pw::stream::StreamRc::new(core, "pipecap-video", props)?;
     let values = video_format_params(fps);
-    let mut params = [Pod::from_bytes(&values).unwrap()];
+    let pod = Pod::from_bytes(&values)
+        .ok_or_else(|| anyhow::anyhow!("invalid pod bytes for video format"))?;
+    let mut params = [pod];
 
     let frame_num = Arc::new(AtomicU64::new(0));
     let fc = frame_num.clone();
 
+    // Negotiated video info shared with the process callback so we don't
+    // have to derive width/height from chunk size + stride (which is wrong
+    // for padded formats).
     let _listener = stream
-        .add_local_listener_with_user_data(())
-        .param_changed(|_, _, id, param| {
+        .add_local_listener_with_user_data(spa::param::video::VideoInfoRaw::default())
+        .param_changed(|_, vi, id, param| {
             let Some(param) = param else { return };
-            if id != spa::param::ParamType::Format.as_raw() { return; }
-            let mut vi = spa::param::video::VideoInfoRaw::default();
+            if id != spa::param::ParamType::Format.as_raw() {
+                return;
+            }
             if vi.parse(param).is_ok() {
-                eprintln!("pipecap: negotiated {:?} {}x{} {}/{}fps",
-                    vi.format(), vi.size().width, vi.size().height,
-                    vi.framerate().num, vi.framerate().denom);
+                eprintln!(
+                    "pipecap: negotiated {:?} {}x{} {}/{}fps",
+                    vi.format(),
+                    vi.size().width,
+                    vi.size().height,
+                    vi.framerate().num,
+                    vi.framerate().denom
+                );
             }
         })
-        .process(move |stream_ref, _| {
-            let n = fc.fetch_add(1, Ordering::Relaxed);
+        .process(move |stream_ref, vi| {
+            let n = fc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let Some(mut buffer) = stream_ref.dequeue_buffer() else { return };
             let Some(data) = buffer.datas_mut().first_mut() else { return };
 
             let chunk = data.chunk();
             let (size, stride) = (chunk.size() as usize, chunk.stride());
-            if size == 0 || stride <= 0 { return; }
-
+            if size == 0 || stride <= 0 {
+                return;
+            }
             let offset = chunk.offset() as usize;
-            let w = stride as u32 / 4;
-            let h = size as u32 / stride as u32;
+
+            let (w, h) = (vi.size().width, vi.size().height);
+            // Fall back to size/stride only if format hasn't been negotiated yet.
+            let (w, h) = if w == 0 || h == 0 {
+                (stride as u32 / 4, size as u32 / stride as u32)
+            } else {
+                (w, h)
+            };
+            if w == 0 || h == 0 {
+                return;
+            }
+
             let Some(slice) = data.data() else { return };
-            if offset + size > slice.len() || w == 0 || h == 0 { return; }
+            if offset.saturating_add(size) > slice.len() {
+                return;
+            }
 
             shm.write_frame(w, h, stride as u32, &slice[offset..offset + size]);
 
@@ -162,17 +193,16 @@ fn run_capture_loop(
     )?;
     eprintln!("pipecap: stream connected to node {node_id}");
 
-    // Poll stop flag and quit when signaled
+    // Cross-thread shutdown via pipewire channel — wakes the loop immediately
+    // instead of polling a flag every 100ms.
     let mainloop_weak = mainloop.downgrade();
-    let _timer = mainloop.loop_().add_timer(move |_| {
-        if stop_flag.load(Ordering::Relaxed) {
-            if let Some(ml) = mainloop_weak.upgrade() { ml.quit(); }
+    let _recv = receiver.attach(mainloop.loop_(), move |msg| match msg {
+        CaptureMsg::Stop => {
+            if let Some(ml) = mainloop_weak.upgrade() {
+                ml.quit();
+            }
         }
     });
-    _timer.update_timer(
-        Some(std::time::Duration::from_millis(100)),
-        Some(std::time::Duration::from_millis(100)),
-    );
 
     mainloop.run();
     Ok(())

@@ -1,23 +1,25 @@
 //! PipeWire audio capture.
 //!
-//! Three strategies:
-//!   - `system`: sink monitor (all desktop audio)
-//!   - `app`: per-app via registry watching + session matcher
-//!   - (future) fallback when app can't be identified
+//! Strategies:
+//!   - `System`: sink monitor (all desktop audio)
+//!   - `AppFromVideoNode` / `AppByName`: per-app via registry watching
+//!   - `SystemExcludePids`: capture every output stream except those whose
+//!     `application.process.id` is in the exclude list, and mix them. Used
+//!     to avoid hearing the calling app inside its own screen-share.
 
 pub mod app;
+pub mod mix;
 pub mod resolve;
 pub mod system;
+pub mod system_exclude;
 
 use pipewire as pw;
 use pw::spa;
 use spa::pod::Pod;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
+use std::sync::Arc;
 
 use crate::pw_util;
+use mix::MixBuffer;
 
 pub const MAX_SAMPLES: usize = 48000 * 2 * 2;
 
@@ -37,57 +39,65 @@ pub enum AudioTarget {
     System,
     AppFromVideoNode(u32),
     AppByName(String),
+    SystemExcludePids(Vec<u32>),
+}
+
+/// Internal control message sent from the controller thread to a PipeWire
+/// loop running in a worker thread. Replaces the old 100ms polling timer.
+pub enum AudioCtl {
+    Stop,
 }
 
 pub struct AudioCapturer {
-    buffer: Arc<Mutex<Vec<f32>>>,
-    channels: Arc<Mutex<u32>>,
-    sample_rate: Arc<Mutex<u32>>,
-    stop_flag: Arc<AtomicBool>,
+    mix: Arc<MixBuffer>,
+    sender: pw::channel::Sender<AudioCtl>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AudioCapturer {
     pub fn new(target: AudioTarget) -> anyhow::Result<Self> {
-        let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
-        let channels = Arc::new(Mutex::new(2u32));
-        let sample_rate = Arc::new(Mutex::new(48000u32));
-        let stop_flag = Arc::new(AtomicBool::new(false));
+        let mix = Arc::new(MixBuffer::new());
+        let (sender, receiver) = pw::channel::channel::<AudioCtl>();
 
-        let (buf, ch, sr, stop) = (
-            buffer.clone(), channels.clone(), sample_rate.clone(), stop_flag.clone(),
-        );
+        let mix_t = mix.clone();
 
-        let thread = std::thread::spawn(move || {
-            let result = match target {
-                AudioTarget::System => system::run(buf, ch, sr, stop),
-                AudioTarget::AppFromVideoNode(id) => app::run(id, buf, ch, sr, stop),
-                AudioTarget::AppByName(name) => app::run_by_name(name, buf, ch, sr, stop),
-            };
-            if let Err(e) = result {
-                eprintln!("pipecap-audio: error: {e}");
-            }
-        });
+        let thread = std::thread::Builder::new()
+            .name("pipecap-audio".into())
+            .spawn(move || {
+                let result = match target {
+                    AudioTarget::System => system::run(mix_t, receiver),
+                    AudioTarget::AppFromVideoNode(id) => app::run(id, mix_t, receiver),
+                    AudioTarget::AppByName(name) => app::run_by_name(name, mix_t, receiver),
+                    AudioTarget::SystemExcludePids(pids) => {
+                        system_exclude::run(pids, mix_t, receiver)
+                    }
+                };
+                if let Err(e) = result {
+                    eprintln!("pipecap-audio: error: {e}");
+                }
+            })?;
 
-        Ok(Self { buffer, channels, sample_rate, stop_flag, thread: Some(thread) })
+        Ok(Self {
+            mix,
+            sender,
+            thread: Some(thread),
+        })
     }
 
     pub fn read_audio(&self) -> Option<AudioBuffer> {
-        let mut lock = self.buffer.lock().ok()?;
-        if lock.is_empty() { return None; }
-        let data = std::mem::take(&mut *lock);
-        Some(AudioBuffer {
-            channels: *self.channels.lock().ok()?,
-            sample_rate: *self.sample_rate.lock().ok()?,
-            data,
-        })
+        self.mix.drain()
     }
+
+    /// Single-source synthetic id for non-mix modes.
+    pub const SINGLE_SOURCE: u32 = 0;
 }
 
 impl Drop for AudioCapturer {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
-        if let Some(h) = self.thread.take() { let _ = h.join(); }
+        let _ = self.sender.send(AudioCtl::Stop);
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -106,8 +116,25 @@ pub fn audio_format_params() -> Vec<u8> {
 pub fn connect_stream_to(stream: &pw::stream::StreamRc, node_id: Option<u32>) {
     let _ = stream.disconnect();
     let values = audio_format_params();
-    let mut params = [Pod::from_bytes(&values).unwrap()];
-    if let Err(e) = stream.connect(spa::utils::Direction::Input, node_id, STREAM_FLAGS, &mut params) {
+    let Some(pod) = Pod::from_bytes(&values) else {
+        eprintln!("pipecap-audio: failed to build format pod");
+        return;
+    };
+    let mut params = [pod];
+    if let Err(e) = stream.connect(spa::utils::Direction::Input, node_id, STREAM_FLAGS, &mut params)
+    {
         eprintln!("pipecap-audio: connect error: {e}");
     }
+}
+
+/// Reinterpret a PipeWire byte chunk as `&[f32]` safely. Returns `None` if
+/// the bytes are not 4-byte aligned, in which case the chunk is dropped.
+/// f32 has no invalid bit patterns so the only soundness requirement is
+/// alignment, which `align_to` validates at runtime.
+pub fn bytes_as_f32(bytes: &[u8]) -> Option<&[f32]> {
+    let (head, mid, tail) = unsafe { bytes.align_to::<f32>() };
+    if !head.is_empty() || !tail.is_empty() {
+        return None;
+    }
+    Some(mid)
 }

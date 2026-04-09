@@ -4,7 +4,16 @@
 
 use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
 
-const SHM_NAME: &str = "/pipecap-frames";
+/// Per-process shm name. Including the PID prevents collisions when multiple
+/// pipecap consumers run side-by-side (e.g. an Electron app and a CLI test).
+fn shm_name() -> String {
+    format!("/pipecap-frames-{}", std::process::id())
+}
+
+/// Public path for renderer consumers (`/dev/shm` is the linux convention).
+pub fn shm_public_path() -> String {
+    format!("/dev/shm/pipecap-frames-{}", std::process::id())
+}
 
 /// Header stored at the start of the shared memory region.
 /// Renderer polls `seq` to detect new frames.
@@ -39,7 +48,7 @@ impl ShmBuffer {
         let total_size = header_size + max_frame_size * 2;
 
         // Remove any stale shm
-        let name = std::ffi::CString::new(SHM_NAME)?;
+        let name = std::ffi::CString::new(shm_name())?;
         unsafe { libc::shm_unlink(name.as_ptr()); }
         let fd = unsafe {
             libc::shm_open(
@@ -139,8 +148,9 @@ impl Drop for ShmBuffer {
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.size);
             libc::close(self.fd);
-            let name = std::ffi::CString::new(SHM_NAME).unwrap();
-            libc::shm_unlink(name.as_ptr());
+            if let Ok(name) = std::ffi::CString::new(shm_name()) {
+                libc::shm_unlink(name.as_ptr());
+            }
         }
     }
 }

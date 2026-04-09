@@ -28,8 +28,14 @@ function loadPipecap() {
  *
  * @param {Electron.IpcMain} ipcMain
  * @param {() => Electron.BrowserWindow | null} getWindow
+ * @param {{ transformStartOptions?: (options: Record<string, unknown>) => Record<string, unknown> }} [opts]
+ *   `transformStartOptions` runs in the main process on every `startCapture`
+ *   request — use it to inject things the renderer should not see, e.g.
+ *   `{ excludePids: app.getAppMetrics().map(m => m.pid) }` so the host app
+ *   never appears in its own audio share.
  */
-function setupPipecap(ipcMain, getWindow) {
+function setupPipecap(ipcMain, getWindow, opts = {}) {
+  const transformStartOptions = opts.transformStartOptions || ((o) => o);
   ipcMain.handle('pipecap:available', () => {
     return !!loadPipecap();
   });
@@ -44,14 +50,18 @@ function setupPipecap(ipcMain, getWindow) {
     const pc = loadPipecap();
     if (!pc) return false;
 
-    // Stop any existing capture
+    // Stop any prior audio polling. We deliberately do NOT call
+    // pc.stopCapture() here: the native start_capture already replaces any
+    // existing video/audio capturer, and stopCapture would also close the
+    // PortalHandle that showPicker just stored — the very fd we're about
+    // to consume.
     if (audioInterval) {
       clearInterval(audioInterval);
       audioInterval = null;
     }
-    try { pc.stopCapture(); } catch { /* ignore */ }
 
-    const shmInfo = pc.startCapture(options);
+    const finalOptions = transformStartOptions(options) || options;
+    const shmInfo = pc.startCapture(finalOptions);
 
     // Video frames are delivered via shared memory (shmInfo.shmPath),
     // not IPC — the renderer reads them directly.
@@ -100,6 +110,7 @@ function setupPipecap(ipcMain, getWindow) {
     const pc = loadPipecap();
     return pc ? pc.isCapturing() : false;
   });
+
 }
 
 module.exports = { setupPipecap };

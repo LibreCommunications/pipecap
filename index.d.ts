@@ -12,15 +12,20 @@ export interface PortalStream {
 }
 export interface PickerResult {
   streams: Array<PortalStream>
-  pipewireFd: number
 }
 export interface CaptureOptions {
   nodeId: number
-  pipewireFd: number
   fps: number
   audio: boolean
   /** 1 = monitor, 2 = window. */
   sourceType: number
+  /**
+   * PIDs whose audio output should be excluded from system audio capture.
+   * Pass `[process.pid, ...rendererPids]` to keep the recording app from
+   * hearing itself in its own screen-share. Ignored when `sourceType=2`
+   * resolves to a successful per-app capture.
+   */
+  excludePids?: Array<number>
 }
 export interface CaptureInfo {
   shmPath: string
@@ -44,6 +49,9 @@ export declare function showPicker(sourceTypes: number): Promise<PickerResult | 
 /**
  * Start capture. Auto-detects audio target for window captures.
  * Returns `detectedApp` so the frontend knows whether to show a picker.
+ *
+ * Must be called after a successful `showPicker()` — uses the PipeWire fd
+ * owned by the most recent portal handle.
  */
 export declare function startCapture(options: CaptureOptions): CaptureInfo
 /**
