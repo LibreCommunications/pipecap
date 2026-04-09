@@ -13,6 +13,11 @@ use std::sync::Mutex;
 static CAPTURER: Mutex<Option<capture::Capturer>> = Mutex::new(None);
 static AUDIO_CAPTURER: Mutex<Option<audio::AudioCapturer>> = Mutex::new(None);
 static PORTAL_HANDLE: Mutex<Option<portal::PortalHandle>> = Mutex::new(None);
+/// Exclude lists from the most recent `start_capture`, reused by
+/// `set_audio_target("system")` so a runtime source switch never
+/// downgrades to a non-filtering capture and re-introduces the self-echo.
+static LAST_EXCLUDE_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static LAST_EXCLUDE_APP_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn err(msg: impl std::fmt::Display) -> Error {
     Error::new(Status::GenericFailure, msg.to_string())
@@ -46,6 +51,16 @@ pub struct CaptureOptions {
     /// hearing itself in its own screen-share. Ignored when `sourceType=2`
     /// resolves to a successful per-app capture.
     pub exclude_pids: Option<Vec<u32>>,
+    /// Application names whose audio output should be excluded from system
+    /// audio capture. Matched case-insensitively against PipeWire's
+    /// `application.name` property on the source node. Use this when PID
+    /// filtering can't reach the right process — e.g. apps connected via
+    /// the PulseAudio compatibility layer (`pipewire-pulse`), which proxies
+    /// many clients onto a single PipeWire Client and drops per-client
+    /// pids in the process. Set `PULSE_PROP="application.name=Foo"` in the
+    /// host app before any audio code initializes so PA stamps the right
+    /// name on every stream you emit.
+    pub exclude_app_names: Option<Vec<String>>,
 }
 
 #[napi(object)]
@@ -146,11 +161,32 @@ pub fn start_capture(options: CaptureOptions) -> Result<CaptureInfo> {
             .into_iter()
             .filter(|p| *p != 0)
             .collect();
+        let exclude_app_names: Vec<String> = options
+            .exclude_app_names
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // Persist for set_audio_target("system") to reuse — see comment
+        // on LAST_EXCLUDE_PIDS.
+        if let Ok(mut g) = LAST_EXCLUDE_PIDS.lock() {
+            *g = exclude_pids.clone();
+        }
+        if let Ok(mut g) = LAST_EXCLUDE_APP_NAMES.lock() {
+            *g = exclude_app_names.clone();
+        }
+
+        let has_exclusion = !exclude_pids.is_empty() || !exclude_app_names.is_empty();
         let system_target = || -> audio::AudioTarget {
-            if exclude_pids.is_empty() {
-                audio::AudioTarget::System
+            if has_exclusion {
+                audio::AudioTarget::SystemExcludeSelf {
+                    pids: exclude_pids.clone(),
+                    app_names: exclude_app_names.clone(),
+                }
             } else {
-                audio::AudioTarget::SystemExcludePids(exclude_pids.clone())
+                audio::AudioTarget::System
             }
         };
 
@@ -183,12 +219,14 @@ pub fn start_capture(options: CaptureOptions) -> Result<CaptureInfo> {
 }
 
 /// Switch audio target at runtime. Recreates the audio capturer.
-/// `target`: "system", "none", or an app name.
+/// `target` is `"system"`, `"none"`, or an app name. The `"system"` path
+/// reuses the exclude lists persisted by the last `start_capture` so
+/// runtime switches can't bypass self-exclusion.
 #[napi]
 pub fn set_audio_target(target: String) -> Result<()> {
     let mut lock = AUDIO_CAPTURER.lock().map_err(err)?;
 
-    // Drop existing capturer
+    // Drop existing capturer first so the new one starts on a clean slate.
     lock.take();
 
     if target == "none" {
@@ -196,7 +234,19 @@ pub fn set_audio_target(target: String) -> Result<()> {
     }
 
     let audio_target = if target == "system" {
-        audio::AudioTarget::System
+        let pids = LAST_EXCLUDE_PIDS
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let app_names = LAST_EXCLUDE_APP_NAMES
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        if pids.is_empty() && app_names.is_empty() {
+            audio::AudioTarget::System
+        } else {
+            audio::AudioTarget::SystemExcludeSelf { pids, app_names }
+        }
     } else {
         audio::AudioTarget::AppByName(target)
     };

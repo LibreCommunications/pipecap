@@ -1,33 +1,18 @@
-//! System audio capture that excludes one or more PIDs.
+//! System audio capture with per-process exclusion. Used so a
+//! screen-recording app doesn't hear itself in the share.
 //!
-//! Used so a screen-recording app does not hear itself in the recording.
-//!
-//! ## Why this is harder than it looks
-//!
-//! PipeWire does **not** put `application.process.id` on the registry global
-//! props of `Stream/Output/Audio` nodes — Chromium / WebRTC / Firefox set
-//! it on the parent **Client** object instead, and the Node only carries a
-//! `client.id` reference. So filtering nodes by their own props will see
-//! `pid=None` for everything and let the host app's audio leak straight
-//! into the share.
-//!
-//! What we actually do:
-//!   1. Watch `Client` globals and build a `client_id -> pid` map. We
-//!      prefer `pipewire.sec.pid` (kernel-vouched via SO_PEERCRED — the
-//!      client cannot lie about it) and fall back to the client-supplied
-//!      `application.process.id` if the secure key isn't present.
-//!   2. Watch `Stream/Output/Audio` Node globals, look up `client.id` in
-//!      the map, and capture only if the resolved pid is not in the
-//!      exclude list.
-//!   3. Handle the race where a Node global arrives before its Client
-//!      during the initial registry replay by parking the node in a
-//!      pending list and re-evaluating it when the Client appears.
+//! Per-app pids aren't on the registry global event for audio nodes —
+//! only on the full info dict you get from binding the node. So for every
+//! `Stream/Output/Audio` node we see, we bind a `pw::node::Node` proxy
+//! and attach an info listener; when the info fires we read the real pid
+//! and decide whether to capture or skip. Same path `pw-cli info` /
+//! `pw-dump` use.
 
 use pipewire as pw;
 use pw::spa;
 use pw::types::ObjectType;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -39,30 +24,47 @@ struct LiveStream {
     _listener: pw::stream::StreamListener<spa::param::audio::AudioInfoRaw>,
 }
 
-#[derive(Clone)]
-struct PendingNode {
-    client_id: u32,
-    app_name: Option<String>,
+/// Bound Node proxy + its info listener. Both must stay alive — dropping
+/// either tears down the binding and the info event never arrives.
+struct NodeBinding {
+    _node: pw::node::Node,
+    _listener: pw::node::NodeListener,
 }
 
 struct State {
-    /// pipewire client global id -> os pid
-    client_pids: HashMap<u32, u32>,
-    /// node id -> live capture stream (kept alive)
+    /// node id -> active capture stream
     live: HashMap<u32, LiveStream>,
-    /// node id -> info we already saw, waiting for the client to appear
-    pending: HashMap<u32, PendingNode>,
+    /// Nodes we've already made a final capture/exclude decision about.
+    /// PipeWire fires `info` more than once per node and later events may
+    /// carry only delta props (no application.process.id) — without this
+    /// set we'd re-evaluate with empty pids and accidentally capture a
+    /// node we just excluded.
+    decided: HashSet<u32>,
+    /// node id -> bound Node + info listener, kept alive until
+    /// `global_remove` so the listener can re-fire on property updates.
+    pending_bindings: HashMap<u32, NodeBinding>,
     exclude_pids: Vec<u32>,
+    /// Lower-cased app names to exclude. Useful when the host sets a
+    /// unique `application.name` — Chromium-based apps can't, but native
+    /// PW apps usually can.
+    exclude_app_names_lower: Vec<String>,
 }
 
-fn parse_pid(props: &spa::utils::dict::DictRef) -> Option<u32> {
-    // pipewire.sec.pid is set by the server from SO_PEERCRED — the client
-    // cannot forge it. application.process.id is client-supplied and is the
-    // legacy fallback for setups where the secure key isn't published.
-    let raw = props
-        .get("pipewire.sec.pid")
-        .or_else(|| props.get("application.process.id"))?;
-    raw.parse().ok()
+/// Pull every pid-like property out of a dict. Order doesn't matter —
+/// the caller only checks membership.
+fn parse_pids(props: &spa::utils::dict::DictRef) -> Vec<u32> {
+    let mut pids: Vec<u32> = Vec::new();
+    for key in ["pipewire.sec.pid", "application.process.id"] {
+        if let Some(v) = props.get(key).and_then(|s| s.parse::<u32>().ok())
+            && !pids.contains(&v) {
+                pids.push(v);
+            }
+    }
+    pids
+}
+
+fn any_excluded(pids: &[u32], exclude: &[u32]) -> bool {
+    pids.iter().any(|p| exclude.contains(p))
 }
 
 fn create_stream(
@@ -122,36 +124,55 @@ fn create_stream(
     })
 }
 
-/// Decide what to do with a node now that we know its pid (or that there
-/// is no pid mapping yet). Returns true if a stream was created.
+/// Decide what to do with a node. Excluded if *either* the pid or the
+/// app-name matches our exclude lists. Empty `pids` and unknown `app_name`
+/// mean we have nothing to filter on — capture conservatively rather than
+/// silently dropping potentially-unrelated audio.
 fn try_attach(
     state: &mut State,
     core: &pw::core::CoreRc,
     mix: &Arc<MixBuffer>,
     node_id: u32,
-    pid: Option<u32>,
+    pids: &[u32],
     app_name: Option<&str>,
 ) {
-    if let Some(pid) = pid {
-        if state.exclude_pids.contains(&pid) {
-            eprintln!(
-                "pipecap-audio: excluding node {node_id} pid={pid} app={app_name:?}"
-            );
-            return;
+    // Once decided, a node stays decided until `global_remove`. See
+    // `State.decided` for why.
+    if state.decided.contains(&node_id) {
+        return;
+    }
+
+    let pid_match = !pids.is_empty() && any_excluded(pids, &state.exclude_pids);
+    let name_match = match app_name {
+        Some(name) => {
+            let lower = name.to_lowercase();
+            state.exclude_app_names_lower.iter().any(|n| n == &lower)
         }
+        None => false,
+    };
+
+    if pid_match || name_match {
+        let reason = if pid_match { "pid" } else { "name" };
         eprintln!(
-            "pipecap-audio: capturing node {node_id} pid={pid} app={app_name:?}"
+            "pipecap-audio: excluding node {node_id} pids={pids:?} app={app_name:?} (matched {reason})"
+        );
+        state.decided.insert(node_id);
+        return;
+    }
+
+    if pids.is_empty() && app_name.is_none() {
+        eprintln!(
+            "pipecap-audio: capturing node {node_id} (no identifying info)"
         );
     } else {
-        // No pid resolvable — be conservative and capture (better to share
-        // an unrelated stream than to silently drop it).
         eprintln!(
-            "pipecap-audio: capturing node {node_id} pid=? app={app_name:?} (no client mapping)"
+            "pipecap-audio: capturing node {node_id} pids={pids:?} app={app_name:?}"
         );
     }
     match create_stream(core, node_id, mix) {
         Ok(s) => {
             state.live.insert(node_id, s);
+            state.decided.insert(node_id);
         }
         Err(e) => eprintln!("pipecap-audio: stream create error: {e}"),
     }
@@ -159,25 +180,37 @@ fn try_attach(
 
 pub fn run(
     exclude_pids: Vec<u32>,
+    exclude_app_names: Vec<String>,
     mix: Arc<MixBuffer>,
     receiver: pw::channel::Receiver<AudioCtl>,
 ) -> anyhow::Result<()> {
     pw::init();
 
-    eprintln!("pipecap-audio: system-exclude mode, excluding pids={exclude_pids:?}");
+    let exclude_app_names_lower: Vec<String> =
+        exclude_app_names.iter().map(|s| s.to_lowercase()).collect();
+    eprintln!(
+        "pipecap-audio: system-exclude mode, excluding pids={exclude_pids:?} app_names={exclude_app_names:?}"
+    );
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
+    // `get_registry_rc` returns an Rc<Registry>; we need that (rather than
+    // the lifetime-bound `get_registry`) because we have to call
+    // `registry.bind(global)` from inside the registry's own `global`
+    // listener closure, which requires capturing a 'static registry
+    // reference. The pattern is straight from pipewire-rs's pw-mon example.
     let registry = core
-        .get_registry()
-        .map_err(|e| anyhow::anyhow!("get_registry: {e}"))?;
+        .get_registry_rc()
+        .map_err(|e| anyhow::anyhow!("get_registry_rc: {e}"))?;
+    let registry_weak = registry.downgrade();
 
     let state = Rc::new(RefCell::new(State {
-        client_pids: HashMap::new(),
         live: HashMap::new(),
-        pending: HashMap::new(),
+        decided: HashSet::new(),
+        pending_bindings: HashMap::new(),
         exclude_pids,
+        exclude_app_names_lower,
     }));
 
     let state_g = state.clone();
@@ -191,88 +224,77 @@ pub fn run(
             let Some(props) = global.props else { return };
             let mut s = state_g.borrow_mut();
 
-            match global.type_ {
-                ObjectType::Client => {
-                    let Some(pid) = parse_pid(props) else { return };
-                    s.client_pids.insert(global.id, pid);
+            if global.type_ == ObjectType::Node {
+                if props.get("media.class") != Some("Stream/Output/Audio") {
+                    return;
+                }
+                let app_name = props.get("application.name").map(|v| v.to_string());
 
-                    // Resolve any nodes that were waiting on this client.
-                    let to_resolve: Vec<(u32, PendingNode)> = s
-                        .pending
-                        .iter()
-                        .filter(|(_, snap)| snap.client_id == global.id)
-                        .map(|(id, snap)| (*id, snap.clone()))
-                        .collect();
-                    for (node_id, snap) in to_resolve {
-                        s.pending.remove(&node_id);
+                // The registry global only delivers a minimal property
+                // subset for audio nodes — `application.process.id` lives
+                // on the full info dict you get from binding the node.
+                // See module-level docs.
+                let Some(reg) = registry_weak.upgrade() else { return };
+                let node: pw::node::Node = match reg.bind(global) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!(
+                            "pipecap-audio: bind node {} failed: {e} — capturing conservatively",
+                            global.id
+                        );
                         try_attach(
                             &mut s,
                             &core_g,
                             &mix_g,
-                            node_id,
-                            Some(pid),
-                            snap.app_name.as_deref(),
+                            global.id,
+                            &[],
+                            app_name.as_deref(),
                         );
-                    }
-                }
-                ObjectType::Node => {
-                    if props.get("media.class") != Some("Stream/Output/Audio") {
                         return;
                     }
-                    let app_name = props.get("application.name").map(|v| v.to_string());
-                    let client_id = props
-                        .get("client.id")
-                        .and_then(|v| v.parse::<u32>().ok());
+                };
 
-                    match client_id {
-                        Some(cid) => match s.client_pids.get(&cid).copied() {
-                            Some(pid) => {
-                                try_attach(
-                                    &mut s,
-                                    &core_g,
-                                    &mix_g,
-                                    global.id,
-                                    Some(pid),
-                                    app_name.as_deref(),
-                                );
-                            }
-                            None => {
-                                // Client hasn't appeared yet — park it.
-                                s.pending.insert(
-                                    global.id,
-                                    PendingNode {
-                                        client_id: cid,
-                                        app_name,
-                                    },
-                                );
-                            }
-                        },
-                        None => {
-                            // No client.id at all — capture conservatively.
-                            try_attach(
-                                &mut s,
-                                &core_g,
-                                &mix_g,
-                                global.id,
-                                None,
-                                app_name.as_deref(),
-                            );
-                        }
-                    }
-                }
-                _ => {}
+                let node_id = global.id;
+                let app_name_for_info = app_name.clone();
+                let state_for_info = state_g.clone();
+                let core_for_info = core_g.clone();
+                let mix_for_info = mix_g.clone();
+
+                let listener = node
+                    .add_listener_local()
+                    .info(move |info| {
+                        let pids = info
+                            .props()
+                            .map(parse_pids)
+                            .unwrap_or_default();
+                        // Loop callbacks are serial on this thread, so
+                        // this borrow can never race the outer global().
+                        let mut s = state_for_info.borrow_mut();
+                        try_attach(
+                            &mut s,
+                            &core_for_info,
+                            &mix_for_info,
+                            node_id,
+                            &pids,
+                            app_name_for_info.as_deref(),
+                        );
+                    })
+                    .register();
+
+                s.pending_bindings.insert(
+                    global.id,
+                    NodeBinding {
+                        _node: node,
+                        _listener: listener,
+                    },
+                );
             }
         })
         .global_remove(move |id| {
             let mut s = state_r.borrow_mut();
-            // The id could refer to either a node or a client; clean up both.
-            if s.live.remove(&id).is_some() {
-                // Note: mix.remove_source needs the same id we pushed under.
-                // We can't borrow mix here because it's not in scope; do it
-                // outside the borrow.
-            }
-            s.pending.remove(&id);
-            s.client_pids.remove(&id);
+            s.live.remove(&id);
+            s.decided.remove(&id);
+            s.pending_bindings.remove(&id);
         })
         .register();
 

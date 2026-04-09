@@ -39,7 +39,15 @@ pub enum AudioTarget {
     System,
     AppFromVideoNode(u32),
     AppByName(String),
-    SystemExcludePids(Vec<u32>),
+    /// System audio capture that filters out streams whose pid OR
+    /// `application.name` is in the exclude lists. Either list may be
+    /// empty (you'd just have a System target then). Both kinds of
+    /// matching are checked — a stream is excluded if *any* identifier
+    /// matches *any* entry in *either* list.
+    SystemExcludeSelf {
+        pids: Vec<u32>,
+        app_names: Vec<String>,
+    },
 }
 
 /// Internal control message sent from the controller thread to a PipeWire
@@ -68,8 +76,8 @@ impl AudioCapturer {
                     AudioTarget::System => system::run(mix_t, receiver),
                     AudioTarget::AppFromVideoNode(id) => app::run(id, mix_t, receiver),
                     AudioTarget::AppByName(name) => app::run_by_name(name, mix_t, receiver),
-                    AudioTarget::SystemExcludePids(pids) => {
-                        system_exclude::run(pids, mix_t, receiver)
+                    AudioTarget::SystemExcludeSelf { pids, app_names } => {
+                        system_exclude::run(pids, app_names, mix_t, receiver)
                     }
                 };
                 if let Err(e) = result {

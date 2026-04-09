@@ -26,6 +26,18 @@ export interface CaptureOptions {
    * resolves to a successful per-app capture.
    */
   excludePids?: Array<number>
+  /**
+   * Application names whose audio output should be excluded from system
+   * audio capture. Matched case-insensitively against PipeWire's
+   * `application.name` property on the source node. Use this when PID
+   * filtering can't reach the right process — e.g. apps connected via
+   * the PulseAudio compatibility layer (`pipewire-pulse`), which proxies
+   * many clients onto a single PipeWire Client and drops per-client
+   * pids in the process. Set `PULSE_PROP="application.name=Foo"` in the
+   * host app before any audio code initializes so PA stamps the right
+   * name on every stream you emit.
+   */
+  excludeAppNames?: Array<string>
 }
 export interface CaptureInfo {
   shmPath: string
@@ -56,7 +68,9 @@ export declare function showPicker(sourceTypes: number): Promise<PickerResult | 
 export declare function startCapture(options: CaptureOptions): CaptureInfo
 /**
  * Switch audio target at runtime. Recreates the audio capturer.
- * `target`: "system", "none", or an app name.
+ * `target` is `"system"`, `"none"`, or an app name. The `"system"` path
+ * reuses the exclude lists persisted by the last `start_capture` so
+ * runtime switches can't bypass self-exclusion.
  */
 export declare function setAudioTarget(target: string): void
 /** List applications currently producing audio. */

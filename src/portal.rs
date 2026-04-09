@@ -10,20 +10,6 @@ use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::{PersistMode, ResponseError, Session};
 use ashpd::enumflags2::BitFlags;
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
-
-/// Best-effort cleanup of any restore-token file left behind by an earlier
-/// build that experimented with `PersistMode::ExplicitlyRevoked`. Called once
-/// from `request_screen_cast` so users upgrading don't get a stale silent
-/// re-pick on first launch. Safe to remove in a future release.
-fn purge_legacy_restore_token() {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
-    if let Some(base) = base {
-        let _ = std::fs::remove_file(base.join("pipecap").join("restore-token"));
-    }
-}
 
 pub struct StreamInfo {
     pub node_id: u32,
@@ -65,7 +51,6 @@ impl PortalHandle {
 /// Show the native screen picker via xdg-desktop-portal.
 /// Returns `Ok(None)` if the user cancelled.
 pub async fn request_screen_cast(source_types: u32) -> anyhow::Result<Option<PortalHandle>> {
-    purge_legacy_restore_token();
     let proxy = Screencast::new().await?;
     let session = proxy.create_session().await?;
 
